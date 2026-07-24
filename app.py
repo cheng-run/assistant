@@ -27,7 +27,7 @@ rag = RAGTool()
 #  回调函数
 # ═══════════════════════════════════════════════════════════════
 
-def on_upload(file, progress: gr.Progress = gr.Progress()):
+def on_upload(file, visual_enabled=False, progress: gr.Progress = gr.Progress()):
     """文档上传 → 索引（分阶段进度可视化）"""
     if file is None:
         sources = rag.vector_store.list_sources()
@@ -54,22 +54,33 @@ def on_upload(file, progress: gr.Progress = gr.Progress()):
         progress(0.30, desc=f"🧠 [4/4] 正在向量化（共 {len(chunks)} 块，约需 1-2 分钟）...")
         count = rag.vector_store.add(chunks, source_file=fname)
 
+        # ── 视觉索引（可选） ──
+        if visual_enabled and file.name.lower().endswith('.pdf'):
+            progress(0.70, desc=f"🎨 [视觉] 正在生成页面图片并索引视觉层...")
+            try:
+                visual_count = rag._index_visual_pages(fname, file.name)
+                count += visual_count
+            except Exception as ve:
+                pass  # 视觉索引失败不影响文本路径
+
         # ── 完成 ──
         progress(1.0, desc="✅ 完成！")
         sources = rag.vector_store.list_sources()
-        return f"✅ 已索引 **{fname}**（{count} 个片段）\n\n📊 全部文档: {', '.join(sources)}"
+        visual_note = " (含视觉索引)" if visual_enabled else ""
+        return f"✅ 已索引 **{fname}**（{count} 个片段）{visual_note}\n\n📊 全部文档: {', '.join(sources)}"
     except Exception as e:
         return f"❌ 索引失败: {e}"
 
 
-def on_message(message, history, rag_enabled):
+def on_message(message, history, rag_enabled, visual_enabled=False):
     """
     多轮对话回调（流式输出）。
 
     参数:
-        message:     用户输入文本
-        history:     Chatbot 的当前消息列表 [{"role": ..., "content": ...}, ...]
-        rag_enabled: RAG 开关状态
+        message:       用户输入文本
+        history:       Chatbot 的当前消息列表 [{"role": ..., "content": ...}, ...]
+        rag_enabled:   RAG 开关状态
+        visual_enabled: 视觉检索开关
     """
     if not message:
         yield history
@@ -90,7 +101,7 @@ def on_message(message, history, rag_enabled):
     # RAG 上下文注入
     if rag_enabled:
         try:
-            chunks = rag.retrieve(message, top_k=3)
+            chunks = rag.retrieve(message, top_k=3, enable_visual=visual_enabled)
             if chunks:
                 parts = []
                 for c in chunks:
@@ -179,6 +190,12 @@ with gr.Blocks(title="智能文档问答助手") as demo:
             scale=1,
             info="基于文档回答",
         )
+        visual_toggle = gr.Checkbox(
+            label="👁 视觉检索",
+            value=False,
+            scale=1,
+            info="CLIP+DeepSeek 图表理解",
+        )
         clear_btn = gr.Button(
             "🗑 清空对话",
             variant="secondary",
@@ -217,14 +234,14 @@ with gr.Blocks(title="智能文档问答助手") as demo:
     # 文档上传
     file_upload.change(
         on_upload,
-        inputs=[file_upload],
+        inputs=[file_upload, visual_toggle],
         outputs=[status],
     )
 
     # 对话提交（流式）
     msg_event = chat_input.submit(
         on_message,
-        inputs=[chat_input, chatbot, rag_toggle],
+        inputs=[chat_input, chatbot, rag_toggle, visual_toggle],
         outputs=[chatbot],
     )
     # 发送后清空输入框

@@ -151,6 +151,63 @@ class LocalEmbedder:
 
 
 # ═══════════════════════════════════════════════════════════════
+#  本地图像嵌入器（多模态检索用）
+# ═══════════════════════════════════════════════════════════════
+
+class ImageEmbedder:
+    """
+    基于 fastembed 的本地图像嵌入器 (ONNX, CPU/AMD 友好)。
+
+    模型: Qdrant/clip-ViT-B-32-vision (512d)
+    备选: Qdrant/Unicom-ViT-B-16 (768d, 精度更高)
+
+    用法:
+        ie = ImageEmbedder()
+        vec = ie.embed_image("page_0.png")
+        vecs = ie.embed_batch(["p1.png", "p2.png"])
+    """
+
+    SUPPORTED_MODELS = [
+        "Qdrant/clip-ViT-B-32-vision",     # 512d, 轻量
+        "Qdrant/Unicom-ViT-B-16",          # 768d, 精度更高
+        "jinaai/jina-clip-v1",             # 768d, 最新
+    ]
+
+    def __init__(self, model_name: str = "Qdrant/clip-ViT-B-32-vision"):
+        self.model_name = model_name
+        self._model = None  # 懒加载
+
+    @property
+    def model(self):
+        if self._model is None:
+            from fastembed import ImageEmbedding
+            self._model = ImageEmbedding(model_name=self.model_name)
+        return self._model
+
+    @property
+    def dim(self) -> int:
+        """返回当前模型的向量维度"""
+        dims = {
+            "Qdrant/clip-ViT-B-32-vision": 512,
+            "Qdrant/Unicom-ViT-B-16": 768,
+            "jinaai/jina-clip-v1": 768,
+        }
+        return dims.get(self.model_name, 512)
+
+    def embed_image(self, image_path: str) -> List[float]:
+        """单张图片嵌入"""
+        result = self.embed_batch([image_path])
+        return result[0]
+
+    def embed_batch(self, paths: List[str]) -> List[List[float]]:
+        """批量图片嵌入"""
+        if not paths:
+            return []
+        embeddings = list(self.model.embed(paths))
+        return [vec.tolist() for vec in embeddings]
+
+
+# ═══════════════════════════════════════════════════════════════
 #  向量存储（SQLite）
 # ═══════════════════════════════════════════════════════════════
 
@@ -193,6 +250,7 @@ class VectorStore:
                     token_count     INTEGER DEFAULT 0,
                     source_file     TEXT    DEFAULT '',
                     chunk_index     INTEGER DEFAULT 0,
+                    modality        TEXT    DEFAULT 'text',
                     created_at      TEXT    DEFAULT (datetime('now'))
                 )
             """)
@@ -209,6 +267,15 @@ class VectorStore:
                 "CREATE INDEX IF NOT EXISTS idx_rag_model_dim "
                 "ON rag_chunks(model_dim)"
             )
+
+            # 迁移: 为旧表添加 modality 列（如果不存在）
+            try:
+                conn.execute(
+                    "ALTER TABLE rag_chunks ADD COLUMN modality TEXT DEFAULT 'text'"
+                )
+            except Exception:
+                pass  # 列已存在
+
             conn.commit()
 
     def _conn(self):
@@ -261,14 +328,15 @@ class VectorStore:
                         chunks[i].get("token_count", 0),
                         source_file or chunks[i].get("source_file", ""),
                         chunks[i].get("chunk_index", 0),
+                        chunks[i].get("modality", "text"),
                     )
                     for i in range(len(chunks))
                 ]
                 conn.executemany(
                     """INSERT INTO rag_chunks
                        (content, heading_path, embedding, model_name, model_dim,
-                        token_count, source_file, chunk_index)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                        token_count, source_file, chunk_index, modality)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     rows,
                 )
                 conn.commit()
@@ -278,26 +346,47 @@ class VectorStore:
     # ── 检索 ────────────────────────────
 
     def search(
-        self, query: str, top_k: int = 5, min_score: float = 0.0
+        self, query: str, top_k: int = 5, min_score: float = 0.0,
+        modality_filter: str = None, image_embedder=None,
     ) -> List[Dict]:
         """
         余弦相似度检索。
 
-        1. 检测 query 语言 → 选模型 → embed
-        2. 只检索同维度的向量（跳过维度不匹配的，避免 crash）
-        3. 若无同维度向量，用存量最多的模型重新 embed 查询
+        参数:
+            query:           查询文本
+            top_k:           返回数量
+            min_score:       最低相似度阈值
+            modality_filter: 只返回该模态的结果 ('text' / 'page_image' / ...)
+                            None 表示不过滤
+            image_embedder:  传入 ImageEmbedder 实例时，用 CLIP 嵌入查询
+                            （用于视觉检索路径）
+
+        返回:
+            [{"id": ..., "content": ..., "score": ..., ...}, ...]
         """
         if not query:
             return []
 
         # ── 查询嵌入 ──
-        query_vec, q_lang, model_name, query_dim = self.embedder.embed_with_model(
-            [query]
-        )
-        query_arr = np.array(query_vec[0], dtype=np.float32)
-        q_norm = float(np.linalg.norm(query_arr))
-        if q_norm == 0:
-            return []
+        if image_embedder is not None:
+            # 视觉路径：用 CLIP 把文本查询映射到图像空间
+            query_vec_np = image_embedder.model.embed([query])
+            query_arr = np.array(list(query_vec_np)[0], dtype=np.float32)
+            q_norm = float(np.linalg.norm(query_arr))
+            if q_norm == 0:
+                return []
+            # 视觉路径不需要 model_name/model_dim 对齐
+            model_name = image_embedder.model_name
+            query_dim = image_embedder.dim
+        else:
+            # 文本路径：原有逻辑
+            query_vec, q_lang, model_name, query_dim = self.embedder.embed_with_model(
+                [query]
+            )
+            query_arr = np.array(query_vec[0], dtype=np.float32)
+            q_norm = float(np.linalg.norm(query_arr))
+            if q_norm == 0:
+                return []
 
         # ── 加载所有向量 ──
         with self._lock:
@@ -335,6 +424,12 @@ class VectorStore:
         # ── 计算余弦相似度（仅同维度） ──
         scored: List[Dict] = []
         for row in same_dim_rows:
+            # 模态过滤
+            if modality_filter is not None:
+                row_modality = row["modality"] if "modality" in row.keys() else "text"
+                if row_modality != modality_filter:
+                    continue
+
             stored = np.array(json.loads(row["embedding"]), dtype=np.float32)
             s_norm = float(np.linalg.norm(stored))
             if s_norm == 0:
@@ -355,6 +450,7 @@ class VectorStore:
                     "token_count": row["token_count"],
                     "source_file": row["source_file"],
                     "chunk_index": row["chunk_index"],
+                    "modality": row["modality"] if "modality" in row.keys() else "text",
                 })
 
         scored.sort(key=lambda x: x["score"], reverse=True)

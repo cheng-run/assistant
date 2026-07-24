@@ -29,6 +29,78 @@ def _has_body_text(text: str) -> bool:
     return False
 
 
+# ── 表格检测与转换 ────────────────────
+
+def _is_pipe_table(text: str) -> bool:
+    """
+    检测文本块是否为 Markdown 管道表。
+
+    判断条件:
+      1. 至少 2 行
+      2. 存在分隔行 (|---|---|)
+      3. 所有非空行都以 | 开头
+    """
+    lines = text.strip().splitlines()
+    if len(lines) < 2:
+        return False
+
+    # 存在分隔行：包含 |---| 模式（允许冒号对齐标记 :---:）
+    has_separator = any(
+        re.match(r"^\|[\s\-:]+\|", ln) for ln in lines
+    )
+    if not has_separator:
+        return False
+
+    # 所有非空行以 | 开头
+    return all(
+        ln.strip().startswith("|") for ln in lines if ln.strip()
+    )
+
+
+def _pipe_table_to_json(text: str) -> str:
+    """
+    将 Markdown 管道表转为 JSON 对象列表。
+
+    示例:
+        输入:
+            | 姓名 | 年龄 |
+            |------|------|
+            | 张三 | 30   |
+
+        输出:
+            [{"姓名": "张三", "年龄": "30"}]
+
+    返回:
+        JSON 字符串（ensure_ascii=False, indent=2）
+    """
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+
+    # 过掉分隔行 (|---|:---:|---|)
+    data_lines = [
+        ln for ln in lines
+        if not re.match(r"^\|[\s\-:|\s]+\|$", ln)
+    ]
+    if len(data_lines) < 1:
+        return "[]"
+
+    # 解析表头
+    headers = [h.strip() for h in data_lines[0].split("|")[1:-1]]
+    if not headers:
+        return "[]"
+
+    # 解析数据行
+    rows: list[dict] = []
+    for line in data_lines[1:]:
+        cells = [c.strip() for c in line.split("|")[1:-1]]
+        # 补齐缺失列（合并单元格可能导致列数不一致）
+        while len(cells) < len(headers):
+            cells.append("")
+        row = {headers[i]: cells[i] for i in range(len(headers))}
+        rows.append(row)
+
+    return json.dumps(rows, ensure_ascii=False, indent=2)
+
+
 class RAGTool:
     """
     RAG 文档处理工具 — 三步流水线：转换 → 标题分块 → Token 分块
@@ -51,6 +123,12 @@ class RAGTool:
         self._embedder = None
         self._vector_store = None
 
+        # 懒加载文档转换器
+        self.__docling_converter = None
+
+        # 懒加载图像嵌入器
+        self._image_embedder = None
+
     @property
     def embedder(self):
         if self._embedder is None:
@@ -66,6 +144,21 @@ class RAGTool:
             self._vector_store = VectorStore(self.embedder, db_path=db_path)
         return self._vector_store
 
+    # ── 文档转换器懒加载 ─────────────────
+
+    @property
+    def _docling_converter(self):
+        """懒加载 Docling 文档转换器"""
+        if self.__docling_converter is None:
+            try:
+                from docling.document_converter import DocumentConverter
+            except ImportError:
+                raise ImportError(
+                    "处理文档需要 docling，请运行: uv add docling"
+                )
+            self.__docling_converter = DocumentConverter()
+        return self.__docling_converter
+
     # ═══════════════════════════════════════════════════════════════
     #  第零步：文档 → Markdown
     # ═══════════════════════════════════════════════════════════════
@@ -77,8 +170,8 @@ class RAGTool:
         支持格式:
             .md   — 直接读取
             .txt  — 直接读取
-            .docx — 需要 python-docx（可选）
-            .pdf  — 需要 pymupdf / pdfplumber（可选）
+            .docx — 需要 docling（可选）
+            .pdf  — 需要 docling（可选）
 
         参数:
             path: 文件路径或目录路径（目录则递归处理所有支持的文件）
@@ -125,102 +218,223 @@ class RAGTool:
         return "\n\n---\n\n".join(parts)
 
     def _convert_docx(self, file_path: Path) -> str:
-        """docx → markdown（需安装 python-docx）"""
+        """docx → markdown（使用 Docling）"""
         try:
-            from docx import Document
+            converter = self._docling_converter
         except ImportError:
             raise ImportError(
-                "处理 .docx 需要 python-docx，请运行: uv add python-docx"
+                "处理 .docx 需要 docling，请运行: uv add docling"
             )
 
-        doc = Document(str(file_path))
-        md_lines: list[str] = []
-
-        for para in doc.paragraphs:
-            text = para.text.strip()
-            if not text:
-                md_lines.append("")
-                continue
-
-            style = para.style.name if para.style else ""
-            if style.startswith("Heading"):
-                level = style.split()[-1]
-                try:
-                    level = int(level)
-                except ValueError:
-                    level = 1
-                md_lines.append(f"{'#' * level} {text}")
-            elif style == "Title":
-                md_lines.append(f"# {text}")
-            else:
-                # 处理行内格式（粗体、斜体）
-                text = self._format_docx_runs(para)
-                md_lines.append(text)
-
-        return "\n\n".join(md_lines)
-
-    @staticmethod
-    def _format_docx_runs(para) -> str:
-        """处理 docx 段落中的行内格式 run"""
-        result: list[str] = []
-        for run in para.runs:
-            t = run.text
-            if run.bold:
-                t = f"**{t}**"
-            if run.italic:
-                t = f"*{t}*"
-            result.append(t)
-        return "".join(result)
+        result = converter.convert(str(file_path))
+        return result.document.export_to_markdown()
 
     def _convert_pdf(self, file_path: Path) -> str:
-        """pdf → markdown（需安装 pymupdf 或 pdfplumber）"""
-        # 优先尝试 pymupdf (fitz)
-        fitz_available = True
+        """pdf → markdown（使用 Docling）"""
         try:
-            import fitz
+            converter = self._docling_converter
         except ImportError:
-            fitz_available = False
-
-        if fitz_available:
-            try:
-                doc = fitz.open(str(file_path))
-                md_lines: list[str] = []
-                for page in doc:
-                    text = page.get_text("text")
-                    if text:
-                        md_lines.append(text)
-                doc.close()
-                return "\n\n".join(md_lines)
-            except Exception as e:
-                # pymupdf 处理失败（如损坏的 PDF），回退到 pdfplumber
-                pass
-
-        # 回退到 pdfplumber
-        pdfplumber_available = True
-        try:
-            import pdfplumber
-        except ImportError:
-            pdfplumber_available = False
-
-        if pdfplumber_available:
-            try:
-                with pdfplumber.open(str(file_path)) as pdf:
-                    md_lines = []
-                    for page in pdf.pages:
-                        text = page.extract_text()
-                        if text:
-                            md_lines.append(text)
-                    return "\n\n".join(md_lines)
-            except Exception as e:
-                pass
-
-        if not fitz_available and not pdfplumber_available:
             raise ImportError(
-                "处理 .pdf 需要 pymupdf 或 pdfplumber，请运行: uv add pymupdf"
+                "处理 .pdf 需要 docling，请运行: uv add docling"
             )
-        raise ImportError(
-            "处理 .pdf 失败。pymupdf 和 pdfplumber 均已尝试但均无法解析该文件。"
+
+        result = converter.convert(str(file_path))
+        return result.document.export_to_markdown()
+
+    # ── 表格处理 ──────────────────────────
+
+    @staticmethod
+    def _process_tables_in_text(text: str) -> str:
+        """
+        在文本中查找 Markdown 管道表，替换为 JSON 代码块。
+
+        处理方式:
+          1. 按 \\n\\n+ 分割段落
+          2. 检测每个段落是否为管道表
+          3. 是 → 替换为 ```table-json ``` 代码块
+          4. 否 → 保持原样
+
+        返回:
+            处理后的文本
+        """
+        # 按段落边界分割，保留分隔符
+        parts = re.split(r"(\n\n+)", text)
+        result: list[str] = []
+
+        for part in parts:
+            if _is_pipe_table(part):
+                json_str = _pipe_table_to_json(part)
+                result.append(f"```table-json\n{json_str}\n```")
+            else:
+                result.append(part)
+
+        return "".join(result)
+
+    # ── 图像嵌入器懒加载 ─────────────────
+
+    @property
+    def image_embedder(self):
+        """懒加载 CLIP 图像嵌入器"""
+        if self._image_embedder is None:
+            from .embedding import ImageEmbedder
+            self._image_embedder = ImageEmbedder()
+        return self._image_embedder
+
+    # ═══════════════════════════════════════════════════════════════
+    #  视觉页面索引
+    # ═══════════════════════════════════════════════════════════════
+
+    def _generate_page_images(self, path: str, dpi: float = 2.0) -> List[str]:
+        """
+        用 Docling 生成每页截图，保存到 data_db/page_images/，
+        返回路径列表。
+        """
+        from docling.document_converter import PdfFormatOption
+        from docling.datamodel.base_models import InputFormat
+        from docling.datamodel.pipeline_options import PdfPipelineOptions
+
+        # 配置页面图片生成
+        pipeline_options = PdfPipelineOptions()
+        pipeline_options.generate_page_images = True
+        pipeline_options.images_scale = dpi
+
+        from docling.document_converter import DocumentConverter
+        img_converter = DocumentConverter(
+            format_options={
+                InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options)
+            }
         )
+        result = img_converter.convert(path)
+
+        # 保存页面图片
+        img_dir = self.knowledge_base_path / "page_images"
+        img_dir.mkdir(parents=True, exist_ok=True)
+
+        source_name = Path(path).stem
+        page_paths = []
+        for page_no, page in result.document.pages.items():
+            if page.image is not None:
+                img_path = img_dir / f"{source_name}_p{page_no}.png"
+                page.image.save(str(img_path), "PNG")
+                page_paths.append(str(img_path))
+
+        return page_paths
+
+    def _detect_visual_pages(self, path: str) -> set:
+        """
+        检测哪些页码包含图表/表格（供 DeepSeek 深度解读）。
+
+        返回: 包含图表的页码集合 {page_no, ...}
+        """
+        result = self._docling_converter.convert(path)
+        doc = result.document
+
+        visual_pages = set()
+        # 统计每页的 figures 和 tables
+        for item, _ in doc.iterate_items():
+            page_no = getattr(item, "prov", [None])[0] if hasattr(item, "prov") else None
+            if page_no is None:
+                continue
+            label = getattr(item, "label", "")
+            if label in ("picture", "figure", "table"):
+                visual_pages.add(page_no)
+
+        return visual_pages
+
+    def _generate_page_description(self, image_path: str) -> str:
+        """
+        用 DeepSeek v4-pro 解读单页图片，返回中文描述。
+        """
+        import base64
+        from llm import ask_llm
+
+        with open(image_path, "rb") as f:
+            b64_data = base64.b64encode(f.read()).decode("utf-8")
+
+        messages = [{
+            "role": "user",
+            "content": [
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/png;base64,{b64_data}"},
+                },
+                {
+                    "type": "text",
+                    "text": (
+                        "请客观描述这张文档页面中出现的图表、表格和关键视觉数据。"
+                        "列出具体数值、趋势和对比关系。只描述内容，不要评价。"
+                        "如果是纯文字页面，回复'纯文字页面，无图表'。"
+                    ),
+                },
+            ],
+        }]
+        return ask_llm(messages=messages) or ""
+
+    def _index_visual_pages(self, source_file: str, doc_path: str) -> int:
+        """
+        索引文档的视觉层：
+        1. Docling 生成页面图片
+        2. CLIP 嵌入每页 → SQLite (modality="page_image")
+        3. 含图表页 → DeepSeek 解读 → BGE 嵌入 → SQLite (modality="visual_description")
+
+        返回: 索引的视觉 chunk 数量
+        """
+        # ── Step 1: 生成页面图片 ──
+        try:
+            page_paths = self._generate_page_images(doc_path)
+        except Exception:
+            page_paths = []
+            # 非 PDF 或图片生成失败，跳过视觉索引
+
+        if not page_paths:
+            return 0
+
+        # ── Step 2: CLIP 嵌入每页 ──
+        page_chunks = []
+        for pp in page_paths:
+            page_no = Path(pp).stem.rsplit("_p", 1)[-1]
+            page_chunks.append({
+                "content": f"[Page {page_no} of {source_file}]",
+                "heading_path": [],
+                "token_count": self._approx_token_len(f"Page {page_no}"),
+                "chunk_index": 0,
+                "source_file": source_file,
+                "modality": "page_image",
+                "embedding": self.image_embedder.embed_image(pp),
+            })
+
+        # ── Step 3: 检测含图表页 → DeepSeek 解读 ──
+        try:
+            visual_page_nos = self._detect_visual_pages(doc_path)
+        except Exception:
+            visual_page_nos = set()
+
+        desc_chunks = []
+        for pp in page_paths:
+            page_no = Path(pp).stem.rsplit("_p", 1)[-1]
+            if int(page_no) in visual_page_nos:
+                try:
+                    desc = self._generate_page_description(pp)
+                    if desc and "纯文字页面" not in desc:
+                        desc_chunks.append({
+                            "content": f"[{source_file} Page {page_no} 图表描述]\n{desc}",
+                            "heading_path": [],
+                            "token_count": self._approx_token_len(desc),
+                            "chunk_index": 0,
+                            "source_file": source_file,
+                            "modality": "text",  # BGE 文本嵌入，自然融入文本检索
+                        })
+                except Exception:
+                    pass  # DeepSeek 调用失败不影响整体
+
+        # ── Step 4: 写入 SQLite ──
+        count = 0
+        if page_chunks:
+            count += self.vector_store.add(page_chunks, source_file=source_file)
+        if desc_chunks:
+            count += self.vector_store.add(desc_chunks, source_file=source_file)
+
+        return count
 
     # ═══════════════════════════════════════════════════════════════
     #  第一步：按标题分块（保持语义完整性）
@@ -332,6 +546,8 @@ class RAGTool:
 
         for section in sections:
             content = section["content"]
+            # 表格预处理：管道表 → JSON
+            content = self._process_tables_in_text(content)
             heading_path = section["heading_path"]
 
             # ── 构建上下文前缀 ──
@@ -345,13 +561,13 @@ class RAGTool:
                 full_content, is_bridge = self._build_chunk_content(
                     content, prefix, bridge
                 )
-                chunk = {
+                chunk = self._enrich_table_chunk({
                     "heading_path": heading_path,
                     "content": full_content,
                     "token_count": self._approx_token_len(full_content),
                     "chunk_index": 0,
                     "cross_section_bridge": is_bridge,
-                }
+                })
                 all_chunks.append(chunk)
                 prev_section_tail = self._last_sentence(content)
                 continue
@@ -368,13 +584,13 @@ class RAGTool:
                     sub_content, prefix, bridge
                 )
 
-                all_chunks.append({
+                all_chunks.append(self._enrich_table_chunk({
                     "heading_path": heading_path,
                     "content": full_content,
                     "token_count": self._approx_token_len(full_content),
                     "chunk_index": i,
                     "cross_section_bridge": is_bridge,
-                })
+                }))
 
             # 当前 section 尾句留给下一个 section
             prev_section_tail = self._last_sentence(content)
@@ -412,6 +628,31 @@ class RAGTool:
         sentences = re.split(r"(?<=[。！？.!?])\s*", text)
         clean = [s.strip() for s in sentences if s.strip()]
         return clean[-1] if clean else ""
+
+    # ── 表格元数据 ────────────────────────
+
+    @staticmethod
+    def _enrich_table_chunk(chunk: Dict) -> Dict:
+        """
+        如果 chunk 内容是 JSON 表格块，提取元数据附加到 chunk dict。
+
+        添加字段:
+          - is_table: True
+          - table_columns: [列名列表]
+          - table_rows: 行数
+        """
+        m = re.search(r"```table-json\n(.*?)\n```", chunk.get("content", ""), re.DOTALL)
+        if not m:
+            return chunk
+        try:
+            data = json.loads(m.group(1))
+            if isinstance(data, list) and len(data) > 0 and isinstance(data[0], dict):
+                chunk["is_table"] = True
+                chunk["table_columns"] = list(data[0].keys())
+                chunk["table_rows"] = len(data)
+        except (json.JSONDecodeError, TypeError):
+            pass
+        return chunk
 
     # ── 长 section 切分 ─────────────────
 
@@ -480,6 +721,13 @@ class RAGTool:
             if para_len > chunk_tokens:
                 if current:
                     finish_chunk(overlap_tokens)
+                # JSON 表格块保持完整，不切割
+                if para.strip().startswith("```table-json"):
+                    chunks.append(para)
+                    current = []
+                    current_len = 0
+                    chunk_count += 1
+                    continue
                 hard_chunks = self._hard_split(
                     para, chunk_tokens, overlap_tokens
                 )
@@ -507,6 +755,10 @@ class RAGTool:
         overlap_tokens: int,
     ) -> List[str]:
         """对单个超长段落按句子边界硬切，带重叠"""
+        # JSON 表格块不切割（兜底保护）
+        if text.strip().startswith("```table-json"):
+            return [text]
+
         sentences = re.split(r"(?<=[。！？.!?])\s*", text)
         sentences = [s.strip() for s in sentences if s.strip()]
         if not sentences:
@@ -549,6 +801,10 @@ class RAGTool:
     @staticmethod
     def _force_split(text: str, chunk_tokens: int, overlap_tokens: int = 16) -> List[str]:
         """最后手段：按字符数硬切，带最小重叠窗口"""
+        # JSON 表格块不切割（兜底保护）
+        if text.strip().startswith("```table-json"):
+            return [text]
+
         char_limit = int(chunk_tokens * 1.5)
         overlap_chars = max(4, int(overlap_tokens * 1.5))
         if char_limit <= overlap_chars or len(text) <= char_limit:
@@ -653,6 +909,7 @@ class RAGTool:
         chunk_tokens: int = 512,
         overlap_tokens: int = 64,
         adaptive_overlap: bool = True,
+        enable_visual: bool = False,
     ) -> int:
         """
         完整索引流水线：分块 → 嵌入 → 存储。
@@ -662,6 +919,7 @@ class RAGTool:
             chunk_tokens:     每块最大 token 数
             overlap_tokens:   块间重叠 token 数
             adaptive_overlap: 启用自适应重叠
+            enable_visual:    启用视觉层索引（页面图片 + CLIP + DeepSeek 解读）
         返回:
             存储的 chunk 数量
         """
@@ -676,22 +934,88 @@ class RAGTool:
             if outline:
                 self._save_outline(source_file, outline)
 
+        # 视觉层索引
+        if enable_visual and Path(path).is_file():
+            try:
+                visual_count = self._index_visual_pages(source_file, path)
+                count += visual_count
+            except Exception:
+                pass  # 视觉索引失败不影响文本路径
+
         return count
 
     def retrieve(
-        self, query: str, top_k: int = 5, min_score: float = 0.0
+        self, query: str, top_k: int = 5, min_score: float = 0.0,
+        enable_visual: bool = False,
     ) -> List[Dict]:
         """
         在已索引的文档中检索最相关的 chunks。
 
         参数:
-            query:     查询文本
-            top_k:     返回数量
-            min_score: 最低相似度阈值
+            query:         查询文本
+            top_k:         返回数量
+            min_score:     最低相似度阈值
+            enable_visual: 启用视觉检索（CLIP + 图表描述）
         返回:
             [{"content": ..., "score": ..., "heading_path": ..., ...}, ...]
         """
-        return self.vector_store.search(query, top_k=top_k, min_score=min_score)
+        if not enable_visual:
+            return self.vector_store.search(
+                query, top_k=top_k, min_score=min_score
+            )
+
+        # ── 双路检索 ──
+        # 文本路径
+        text_results = self.vector_store.search(
+            query, top_k=top_k * 2, min_score=min_score,
+            modality_filter="text",
+        )
+
+        # 视觉路径（CLIP 嵌入查询 → 匹配页面图片）
+        try:
+            visual_results = self.vector_store.search(
+                query, top_k=top_k, min_score=0.0,
+                modality_filter="page_image",
+                image_embedder=self.image_embedder,
+            )
+        except Exception:
+            visual_results = []
+
+        # ── 融合 ──
+        if not visual_results:
+            return text_results[:top_k]
+
+        return self._fusion_results(text_results, visual_results, top_k)
+
+    @staticmethod
+    def _fusion_results(
+        text_results: List[Dict],
+        visual_results: List[Dict],
+        top_k: int,
+    ) -> List[Dict]:
+        """
+        融合文本检索和视觉检索结果。
+
+        策略：视觉命中的页面 → 提升同 source_file 的文本 chunk 分数。
+        """
+        # 视觉命中的 source_file
+        visual_sources = {v.get("source_file", "") for v in visual_results}
+
+        # 给命中视觉页面的文本结果加分
+        fused = {}
+        for r in text_results:
+            cid = r["id"]
+            bonus = 1.15 if r.get("source_file", "") in visual_sources else 1.0
+            if cid not in fused or r["score"] * bonus > fused[cid]["score"]:
+                r_copy = dict(r)
+                r_copy["score"] = round(r["score"] * bonus, 4)
+                fused[cid] = r_copy
+
+        # 视觉描述直接加入（DeepSeek 解读的高价值内容）
+        # 注：visual_description 在文本检索路径中也会被 BGE 搜到，
+        # 因为它们的 embedding 是用 BGE 生成的。这里主要是加分逻辑。
+        ranked = sorted(fused.values(), key=lambda x: x["score"], reverse=True)
+        return ranked[:top_k]
 
     # ═══════════════════════════════════════════════════════════════
     #  高级检索：MQE（多查询扩展）+ HyDE（假设文档嵌入）

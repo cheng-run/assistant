@@ -5,6 +5,6 @@ RAG 文档处理子系统
 → 本地嵌入（fastembed） → 向量存储（SQLite） → 相似度检索
 """
 from .ragtool import RAGTool
-from .embedding import LocalEmbedder, VectorStore
+from .embedding import ImageEmbedder, LocalEmbedder, VectorStore
 
-__all__ = ["RAGTool", "LocalEmbedder", "VectorStore"]
+__all__ = ["ImageEmbedder", "LocalEmbedder", "RAGTool", "VectorStore"]

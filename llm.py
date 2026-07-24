@@ -23,8 +23,11 @@ def _get_client():
     return _client
 
 
-def ask_llm(messages: list = None, question: str = None, max_retries: int = 3) -> str:
-    """调用 LLM，支持传入完整 messages 或简单 question，带自动重试"""
+def ask_llm(messages: list = None, question: str = None, max_retries: int = 3, model: str = None) -> str:
+    """调用 LLM，支持传入完整 messages 或简单 question，带自动重试。
+
+    自动检测视觉消息（content 为 list 的格式），使用 deepseek-v4-pro 模型。
+    """
     if messages is None:
         if question is None:
             raise ValueError("必须提供 messages 或 question 参数")
@@ -33,13 +36,22 @@ def ask_llm(messages: list = None, question: str = None, max_retries: int = 3) -
             {"role": "user", "content": question},
         ]
 
+    # 自动检测视觉消息 → 切换模型
+    has_vision = any(
+        isinstance(m.get("content"), list)
+        for m in messages
+    )
+    model = model or (
+        "deepseek-v4-pro" if has_vision else os.getenv("DEEPSEEK_MODEL_NAME")
+    )
+
     client = _get_client()
     last_error = None
 
     for attempt in range(max_retries):
         try:
             response = client.chat.completions.create(
-                model=os.getenv("DEEPSEEK_MODEL_NAME"),
+                model=model,
                 messages=messages,
                 stream=False,
             )
