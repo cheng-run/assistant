@@ -27,7 +27,7 @@ rag = RAGTool()
 #  回调函数
 # ═══════════════════════════════════════════════════════════════
 
-def on_upload(file, visual_enabled=False, progress: gr.Progress = gr.Progress()):
+def on_upload(file, visual_enabled=False, kg_enabled=False, progress: gr.Progress = gr.Progress()):
     """文档上传 → 索引（分阶段进度可视化）"""
     if file is None:
         sources = rag.vector_store.list_sources()
@@ -35,6 +35,7 @@ def on_upload(file, visual_enabled=False, progress: gr.Progress = gr.Progress())
             return f"📊 已索引 {len(sources)} 个文档: {', '.join(sources)}"
         return "📊 尚未上传文档"
 
+    kg_note = ""
     try:
         fname = file.name.replace("\\", "/").split("/")[-1]
 
@@ -50,9 +51,16 @@ def on_upload(file, visual_enabled=False, progress: gr.Progress = gr.Progress())
         progress(0.20, desc="📝 [3/4] 正在 Token 分块...")
         chunks = rag.chunk_by_tokens(sections)
 
-        # ── 阶段 4：向量化（最耗时） ──
-        progress(0.30, desc=f"🧠 [4/4] 正在向量化（共 {len(chunks)} 块，约需 1-2 分钟）...")
-        count = rag.vector_store.add(chunks, source_file=fname)
+        # ── 阶段 4：向量化（分批+进度） ──
+        total_chunks = len(chunks)
+        batch_size = max(32, total_chunks // 5)  # 至少 5 步进度更新
+        count = 0
+        for i in range(0, total_chunks, batch_size):
+            batch = chunks[i:i + batch_size]
+            done = min(i + batch_size, total_chunks)
+            pct = 0.30 + 0.40 * (done / total_chunks)  # 0.30 → 0.70
+            progress(pct, desc=f"🧠 [4/4] 正在向量化 ({done}/{total_chunks})...")
+            count += rag.vector_store.add(batch, source_file=fname)
 
         # ── 视觉索引（可选） ──
         if visual_enabled and file.name.lower().endswith('.pdf'):
@@ -63,24 +71,40 @@ def on_upload(file, visual_enabled=False, progress: gr.Progress = gr.Progress())
             except Exception as ve:
                 pass  # 视觉索引失败不影响文本路径
 
+        # ── 知识图谱构建（可选） ──
+        if kg_enabled:
+            progress(0.75, desc="🧠 [5/5] 正在构建知识图谱...")
+            try:
+                kg_stats = rag.build_knowledge_graph(
+                    chunks, source_file=fname, source_file_path=file.name
+                )
+                kg_note = (
+                    f" | 知识图谱: {kg_stats['entities']}实体"
+                    f"/{kg_stats['relations']}关系"
+                    f"/{kg_stats['communities']}社区"
+                )
+            except Exception:
+                kg_note = ""
+
         # ── 完成 ──
         progress(1.0, desc="✅ 完成！")
         sources = rag.vector_store.list_sources()
         visual_note = " (含视觉索引)" if visual_enabled else ""
-        return f"✅ 已索引 **{fname}**（{count} 个片段）{visual_note}\n\n📊 全部文档: {', '.join(sources)}"
+        return f"✅ 已索引 **{fname}**（{count} 个片段）{visual_note}{kg_note}\n\n📊 全部文档: {', '.join(sources)}"
     except Exception as e:
         return f"❌ 索引失败: {e}"
 
 
-def on_message(message, history, rag_enabled, visual_enabled=False):
+def on_message(message, history, rag_enabled, visual_enabled=False, kg_enabled=False):
     """
     多轮对话回调（流式输出）。
 
     参数:
-        message:       用户输入文本
-        history:       Chatbot 的当前消息列表 [{"role": ..., "content": ...}, ...]
-        rag_enabled:   RAG 开关状态
+        message:        用户输入文本
+        history:        Chatbot 的当前消息列表 [{"role": ..., "content": ...}, ...]
+        rag_enabled:    RAG 开关状态
         visual_enabled: 视觉检索开关
+        kg_enabled:     知识图谱检索开关
     """
     if not message:
         yield history
@@ -101,7 +125,21 @@ def on_message(message, history, rag_enabled, visual_enabled=False):
     # RAG 上下文注入
     if rag_enabled:
         try:
-            chunks = rag.retrieve(message, top_k=3, enable_visual=visual_enabled)
+            if kg_enabled:
+                # ── KG 增强检索：向量 + 图谱双路 ──
+                kg_context, chunks = rag.retrieve_with_kg(
+                    message, top_k=3, enable_visual=visual_enabled
+                )
+                # 先注入 KG 上下文（结构化概览）
+                if kg_context:
+                    llm_messages.append({
+                        "role": "system",
+                        "content": kg_context,
+                    })
+            else:
+                # ── 纯向量检索 ──
+                chunks = rag.retrieve(message, top_k=3, enable_visual=visual_enabled)
+
             if chunks:
                 parts = []
                 for c in chunks:
@@ -155,6 +193,10 @@ def on_clear():
 def on_clear_docs():
     """清空所有已索引的文档"""
     rag.vector_store.clear()
+    try:
+        rag.kg_store.clear()
+    except Exception:
+        pass
     return "📊 已清空全部索引的文档"
 
 
@@ -196,6 +238,12 @@ with gr.Blocks(title="智能文档问答助手") as demo:
             scale=1,
             info="CLIP+DeepSeek 图表理解",
         )
+        kg_toggle = gr.Checkbox(
+            label="🧠 知识图谱",
+            value=False,
+            scale=1,
+            info="实体关系增强检索",
+        )
         clear_btn = gr.Button(
             "🗑 清空对话",
             variant="secondary",
@@ -234,14 +282,14 @@ with gr.Blocks(title="智能文档问答助手") as demo:
     # 文档上传
     file_upload.change(
         on_upload,
-        inputs=[file_upload, visual_toggle],
+        inputs=[file_upload, visual_toggle, kg_toggle],
         outputs=[status],
     )
 
     # 对话提交（流式）
     msg_event = chat_input.submit(
         on_message,
-        inputs=[chat_input, chatbot, rag_toggle, visual_toggle],
+        inputs=[chat_input, chatbot, rag_toggle, visual_toggle, kg_toggle],
         outputs=[chatbot],
     )
     # 发送后清空输入框
