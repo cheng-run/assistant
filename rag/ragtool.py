@@ -129,6 +129,13 @@ class RAGTool:
         # 懒加载图像嵌入器
         self._image_embedder = None
 
+        # 懒加载知识图谱组件
+        self._kg_store = None
+        self._kg_extractor = None
+        self._kg_detector = None
+        self._kg_summarizer = None
+        self._kg_retriever = None
+
     @property
     def embedder(self):
         if self._embedder is None:
@@ -159,13 +166,42 @@ class RAGTool:
             self.__docling_converter = DocumentConverter()
         return self.__docling_converter
 
+    # ── 文档转换缓存 ──────────────────────
+
+    def _get_conversion_cache_path(self, file_path: str) -> Path:
+        """获取转换缓存目录"""
+        cache_dir = self.knowledge_base_path / "conversion_cache"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        return cache_dir
+
+    def _convert_with_cache(self, file_path: str) -> tuple:
+        """
+        带 MD5 缓存的文档转换。
+        同一文件只转换一次，结果缓存为 .md 文件。
+
+        返回: (markdown_text, is_cache_hit)
+        """
+        import hashlib
+
+        fp = Path(file_path)
+        # 计算文件 MD5
+        file_hash = hashlib.md5(fp.read_bytes()).hexdigest()
+        cache_path = self._get_conversion_cache_path(file_path) / f"{file_hash}.md"
+
+        if cache_path.exists():
+            return cache_path.read_text(encoding="utf-8"), True
+
+        markdown = self._convert_single(fp)
+        cache_path.write_text(markdown, encoding="utf-8")
+        return markdown, False
+
     # ═══════════════════════════════════════════════════════════════
     #  第零步：文档 → Markdown
     # ═══════════════════════════════════════════════════════════════
 
     def convert_to_markdown(self, path: str) -> str:
         """
-        将文档转换为 markdown 文本。
+        将文档转换为 markdown 文本（带 MD5 缓存）。
 
         支持格式:
             .md   — 直接读取
@@ -182,6 +218,12 @@ class RAGTool:
 
         if file_path.is_dir():
             return self._convert_directory(file_path)
+
+        # 单文件：对 .docx/.pdf 使用缓存
+        suffix = file_path.suffix.lower()
+        if suffix in (".docx", ".pdf"):
+            markdown, _ = self._convert_with_cache(path)
+            return markdown
         return self._convert_single(file_path)
 
     def _convert_single(self, file_path: Path) -> str:
@@ -280,14 +322,62 @@ class RAGTool:
             self._image_embedder = ImageEmbedder()
         return self._image_embedder
 
+    # ── 知识图谱组件懒加载 ──────────────
+
+    @property
+    def kg_store(self):
+        """懒加载知识图谱存储"""
+        if self._kg_store is None:
+            from .kg.store import KnowledgeGraphStore
+            db_path = str(self.knowledge_base_path / "kg_graph.db")
+            self._kg_store = KnowledgeGraphStore(db_path=db_path)
+        return self._kg_store
+
+    @property
+    def kg_extractor(self):
+        """懒加载实体关系提取器"""
+        if self._kg_extractor is None:
+            from .kg.extractor import EntityRelationExtractor
+            self._kg_extractor = EntityRelationExtractor()
+        return self._kg_extractor
+
+    @property
+    def kg_detector(self):
+        """懒加载社区检测器"""
+        if self._kg_detector is None:
+            from .kg.community import CommunityDetector
+            self._kg_detector = CommunityDetector()
+        return self._kg_detector
+
+    @property
+    def kg_summarizer(self):
+        """懒加载社区摘要生成器"""
+        if self._kg_summarizer is None:
+            from .kg.community import CommunitySummarizer
+            self._kg_summarizer = CommunitySummarizer()
+        return self._kg_summarizer
+
+    @property
+    def kg_retriever(self):
+        """懒加载图检索器"""
+        if self._kg_retriever is None:
+            from .kg.retriever import KnowledgeGraphRetriever
+            self._kg_retriever = KnowledgeGraphRetriever(
+                store=self.kg_store,
+                embedder=self.embedder,
+            )
+        return self._kg_retriever
+
     # ═══════════════════════════════════════════════════════════════
     #  视觉页面索引
     # ═══════════════════════════════════════════════════════════════
 
-    def _generate_page_images(self, path: str, dpi: float = 2.0) -> List[str]:
+    def _generate_page_images(self, path: str, dpi: float = 2.0) -> tuple:
         """
-        用 Docling 生成每页截图，保存到 data_db/page_images/，
-        返回路径列表。
+        用 Docling 生成每页截图，保存到 data_db/page_images/。
+
+        返回: (page_paths: List[str], doc: DoclingDocument)
+              返回 document 对象以避免重复转换
         """
         from docling.document_converter import PdfFormatOption
         from docling.datamodel.base_models import InputFormat
@@ -305,6 +395,7 @@ class RAGTool:
             }
         )
         result = img_converter.convert(path)
+        doc = result.document
 
         # 保存页面图片
         img_dir = self.knowledge_base_path / "page_images"
@@ -312,25 +403,22 @@ class RAGTool:
 
         source_name = Path(path).stem
         page_paths = []
-        for page_no, page in result.document.pages.items():
+        for page_no, page in doc.pages.items():
             if page.image is not None:
                 img_path = img_dir / f"{source_name}_p{page_no}.png"
                 page.image.save(str(img_path), "PNG")
                 page_paths.append(str(img_path))
 
-        return page_paths
+        return page_paths, doc
 
-    def _detect_visual_pages(self, path: str) -> set:
+    @staticmethod
+    def _detect_visual_pages_from_doc(doc) -> set:
         """
-        检测哪些页码包含图表/表格（供 DeepSeek 深度解读）。
+        从已转换的 Docling document 检测哪些页码包含图表/表格。
 
         返回: 包含图表的页码集合 {page_no, ...}
         """
-        result = self._docling_converter.convert(path)
-        doc = result.document
-
         visual_pages = set()
-        # 统计每页的 figures 和 tables
         for item, _ in doc.iterate_items():
             page_no = getattr(item, "prov", [None])[0] if hasattr(item, "prov") else None
             if page_no is None:
@@ -373,18 +461,17 @@ class RAGTool:
     def _index_visual_pages(self, source_file: str, doc_path: str) -> int:
         """
         索引文档的视觉层：
-        1. Docling 生成页面图片
+        1. Docling 生成页面图片（与检测共享一次转换）
         2. CLIP 嵌入每页 → SQLite (modality="page_image")
         3. 含图表页 → DeepSeek 解读 → BGE 嵌入 → SQLite (modality="visual_description")
 
         返回: 索引的视觉 chunk 数量
         """
-        # ── Step 1: 生成页面图片 ──
+        # ── Step 1: 生成页面图片 + 获取 document（一次转换） ──
         try:
-            page_paths = self._generate_page_images(doc_path)
+            page_paths, doc = self._generate_page_images(doc_path)
         except Exception:
-            page_paths = []
-            # 非 PDF 或图片生成失败，跳过视觉索引
+            return 0
 
         if not page_paths:
             return 0
@@ -403,9 +490,9 @@ class RAGTool:
                 "embedding": self.image_embedder.embed_image(pp),
             })
 
-        # ── Step 3: 检测含图表页 → DeepSeek 解读 ──
+        # ── Step 3: 检测含图表页（复用已转换的 doc，无需再转换） ──
         try:
-            visual_page_nos = self._detect_visual_pages(doc_path)
+            visual_page_nos = self._detect_visual_pages_from_doc(doc)
         except Exception:
             visual_page_nos = set()
 
@@ -422,10 +509,10 @@ class RAGTool:
                             "token_count": self._approx_token_len(desc),
                             "chunk_index": 0,
                             "source_file": source_file,
-                            "modality": "text",  # BGE 文本嵌入，自然融入文本检索
+                            "modality": "text",
                         })
                 except Exception:
-                    pass  # DeepSeek 调用失败不影响整体
+                    pass
 
         # ── Step 4: 写入 SQLite ──
         count = 0
@@ -1167,6 +1254,142 @@ class RAGTool:
         # ── Step 3: 排序返回 ──────────────────
         ranked = sorted(merged.values(), key=lambda x: x["score"], reverse=True)
         return ranked[:top_k]
+
+    # ═══════════════════════════════════════════════════════════════
+    #  知识图谱构建
+    # ═══════════════════════════════════════════════════════════════
+
+    def build_knowledge_graph(
+        self,
+        chunks: List[Dict],
+        source_file: str,
+        source_file_path: str = None,
+    ) -> dict:
+        """
+        从 chunks 构建知识图谱：
+        1. 实体/关系提取（LLM）
+        2. 实体去重
+        3. 写入 SQLite
+        4. 社区检测（Louvain）
+        5. 社区摘要（LLM）+ 嵌入
+        6. chunk-entity 交叉引用
+
+        参数:
+            chunks:           chunk_by_tokens() 的输出
+            source_file:      来源文件名
+            source_file_path: 源文件完整路径（预留，用于未来扩展）
+        返回:
+            {"entities": N, "relations": M, "communities": C}
+        """
+        if not chunks:
+            return {"entities": 0, "relations": 0, "communities": 0}
+
+        # ── Step 1: 实体/关系提取 ──
+        try:
+            entities, relations = self.kg_extractor.extract_from_chunks(
+                chunks, source_file=source_file
+            )
+        except Exception:
+            return {"entities": 0, "relations": 0, "communities": 0}
+
+        if not entities:
+            return {"entities": 0, "relations": 0, "communities": 0}
+
+        # ── Step 2: 写入实体 ──
+        entity_ids = self.kg_store.add_entities(
+            entities, source_file=source_file
+        )
+
+        # ── Step 3: 写入关系 ──
+        rel_count = self.kg_store.add_relations(
+            relations, source_file=source_file
+        )
+
+        # ── Step 4: chunk-entity 交叉引用 ──
+        # 构建 name → entity_id 映射
+        name_to_id = {}
+        for e in entities:
+            canonical = e.get("canonical_name", e.get("name", ""))
+            row = self.kg_store.get_entity_by_name(canonical)
+            if row:
+                name_to_id[canonical] = row["id"]
+
+        refs = []
+        for e in entities:
+            eid = name_to_id.get(e.get("canonical_name", e.get("name", "")))
+            if eid:
+                for chunk_idx in e.get("chunk_refs", []):
+                    if chunk_idx < len(chunks):
+                        chunk_id = chunks[chunk_idx].get("id", chunk_idx)
+                        refs.append((chunk_id, eid))
+
+        if refs:
+            self.kg_store.add_chunk_entity_refs(refs, source_file=source_file)
+
+        # ── Step 5: 社区检测 ──
+        adjacency = self.kg_store.build_adjacency(source_file=source_file)
+        communities = []
+        if adjacency:
+            communities = self.kg_detector.detect(adjacency)
+
+        # ── Step 6: 社区摘要 + 嵌入 ──
+        if communities:
+            entity_map = self.kg_store.get_entities(source_file=source_file)
+            communities = self.kg_summarizer.summarize_all(
+                communities, entity_map, self.kg_store, self.embedder
+            )
+
+        # ── Step 7: 保存社区 ──
+        comm_count = self.kg_store.save_communities(
+            communities, source_file=source_file
+        )
+
+        return {
+            "entities": len(entity_ids),
+            "relations": rel_count,
+            "communities": comm_count,
+        }
+
+    # ═══════════════════════════════════════════════════════════════
+    #  KG 增强检索
+    # ═══════════════════════════════════════════════════════════════
+
+    def retrieve_with_kg(
+        self,
+        query: str,
+        top_k: int = 3,
+        enable_visual: bool = False,
+    ) -> tuple:
+        """
+        双路检索融合：向量检索 + 知识图谱检索。
+
+        参数:
+            query:          查询文本
+            top_k:          向量检索返回数
+            enable_visual:  启用视觉检索
+        返回:
+            (kg_context: str, vector_chunks: List[Dict])
+        """
+        from .kg.retriever import fuse_vector_and_graph
+
+        # ── 路径 1: 向量检索 ──
+        vector_results = self.retrieve(
+            query, top_k=top_k, enable_visual=enable_visual
+        )
+
+        # ── 路径 2: KG 图检索 ──
+        kg_results = []
+        try:
+            kg_results = self.kg_retriever.retrieve(query, top_k=2)
+        except Exception:
+            kg_results = []
+
+        # ── 融合 ──
+        kg_context, chunks = fuse_vector_and_graph(
+            vector_results, kg_results, top_k_vector=top_k
+        )
+
+        return kg_context, chunks
 
     # ═══════════════════════════════════════════════════════════════
     #  文档大纲提取与缓存

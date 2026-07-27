@@ -4,9 +4,10 @@
 嵌入引擎：fastembed（ONNX Runtime，无 PyTorch 依赖，AMD 友好）
 中文模型：BAAI/bge-small-zh-v1.5（512 维）
 英文模型：all-MiniLM-L6-v2（384 维）
-存储引擎：SQLite（向量以 JSON 字符串存储）
+存储引擎：SQLite（向量以 BLOB 存储，含嵌入缓存表）
 检索算法：numpy 余弦相似度
 """
+import hashlib
 import json
 import os
 import threading
@@ -276,6 +277,38 @@ class VectorStore:
             except Exception:
                 pass  # 列已存在
 
+            # 迁移: 为旧表添加 content_hash 列（用于嵌入缓存去重）
+            try:
+                conn.execute(
+                    "ALTER TABLE rag_chunks ADD COLUMN content_hash TEXT DEFAULT ''"
+                )
+            except Exception:
+                pass  # 列已存在
+
+            # 迁移: checkpoint 旧格式 JSON embedding → 新格式 BLOB
+            # （后台自动处理，增量转换）
+            try:
+                conn.execute(
+                    "ALTER TABLE rag_chunks ADD COLUMN embedding_blob BLOB DEFAULT NULL"
+                )
+            except Exception:
+                pass
+
+            # ── 嵌入缓存表 ──
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS embedding_cache (
+                    content_hash TEXT PRIMARY KEY,
+                    embedding    BLOB NOT NULL,
+                    model_name   TEXT DEFAULT '',
+                    model_dim    INTEGER DEFAULT 0,
+                    created_at   TEXT DEFAULT (datetime('now'))
+                )
+            """)
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_emb_cache_model "
+                "ON embedding_cache(model_name, model_dim)"
+            )
+
             conn.commit()
 
     def _conn(self):
@@ -290,31 +323,91 @@ class VectorStore:
 
     # ── 写入 ────────────────────────────
 
+    @staticmethod
+    def _content_hash(text: str) -> str:
+        """计算内容 SHA256 哈希（用于嵌入缓存去重）"""
+        return hashlib.sha256(text.encode("utf-8")).hexdigest()[:32]
+
     def add(
-        self, chunks: List[Dict], source_file: str = "", lang: str = None
+        self, chunks: List[Dict], source_file: str = "", lang: str = None,
+        progress_callback=None, progress_offset: int = 0,
     ) -> int:
         """
-        批量嵌入并存储。
+        批量嵌入并存储（带嵌入缓存 + BLOB 存储）。
 
         参数:
-            chunks:      process() 输出
-            source_file: 来源文件名
-            lang:        语言，None 则自动检测
+            chunks:            process() 输出
+            source_file:      来源文件名
+            lang:             语言，None 则自动检测
+            progress_callback: callable(completed, total) — 进度回调
+            progress_offset:   进度起始偏移量（用于与其他阶段合并进度）
         返回:
             存储条数
         """
         if not chunks:
             return 0
 
-        # ── 提取文本 ──
-        texts = [c["content"] for c in chunks]
+        # ── Step 1: 计算 content_hash ──
+        for c in chunks:
+            c["content_hash"] = self._content_hash(c.get("content", ""))
 
-        # ── 批量嵌入（带回模型信息） ──
-        vectors, lang, model_name, model_dim = self.embedder.embed_with_model(
-            texts, lang=lang
-        )
+        # ── Step 2: 检查嵌入缓存 ──
+        cache_hits = {}
+        uncached_indices = []
+        with self._lock:
+            with self._conn() as conn:
+                for i, c in enumerate(chunks):
+                    row = conn.execute(
+                        "SELECT embedding, model_name, model_dim FROM embedding_cache "
+                        "WHERE content_hash = ?",
+                        (c["content_hash"],),
+                    ).fetchone()
+                    if row:
+                        cache_hits[i] = (row["embedding"], row["model_name"], row["model_dim"])
+                    else:
+                        uncached_indices.append(i)
 
-        # ── 写入 ──
+        # ── Step 3: 批量嵌入未缓存的 chunks ──
+        new_vectors = {}
+        if uncached_indices:
+            uncached_texts = [chunks[i]["content"] for i in uncached_indices]
+            vectors, detected_lang, model_name, model_dim = self.embedder.embed_with_model(
+                uncached_texts, lang=lang
+            )
+            for idx, i in enumerate(uncached_indices):
+                blob = np.array(vectors[idx], dtype=np.float32).tobytes()
+                new_vectors[i] = (blob, model_name, model_dim)
+
+            # 写入缓存
+            with self._lock:
+                with self._conn() as conn:
+                    conn.executemany(
+                        "INSERT OR IGNORE INTO embedding_cache "
+                        "(content_hash, embedding, model_name, model_dim) "
+                        "VALUES (?, ?, ?, ?)",
+                        [
+                            (chunks[i]["content_hash"], blob, model_name, model_dim)
+                            for idx, i in enumerate(uncached_indices)
+                        ],
+                    )
+                    conn.commit()
+
+            lang = detected_lang
+
+        # ── Step 4: 合并缓存命中 + 新嵌入 ──
+        all_vectors = {}
+        for i in range(len(chunks)):
+            if i in cache_hits:
+                all_vectors[i] = cache_hits[i]
+            elif i in new_vectors:
+                all_vectors[i] = new_vectors[i]
+
+        # ── Step 5: 获取一致的 model info ──
+        if not all_vectors:
+            return 0
+        _, first_model_name, first_model_dim = next(iter(all_vectors.values()))
+
+        # ── Step 6: 写入数据库（BLOB 格式） ──
         import sqlite3
         with self._lock:
             with self._conn() as conn:
@@ -322,24 +415,29 @@ class VectorStore:
                     (
                         chunks[i]["content"],
                         json.dumps(chunks[i].get("heading_path", [])),
-                        json.dumps(vectors[i]),
-                        model_name,
-                        model_dim,
+                        chunks[i]["content_hash"],
+                        embedding_blob,
+                        first_model_name,
+                        first_model_dim,
                         chunks[i].get("token_count", 0),
                         source_file or chunks[i].get("source_file", ""),
                         chunks[i].get("chunk_index", 0),
                         chunks[i].get("modality", "text"),
                     )
-                    for i in range(len(chunks))
+                    for i, (embedding_blob, _, _) in all_vectors.items()
                 ]
                 conn.executemany(
                     """INSERT INTO rag_chunks
-                       (content, heading_path, embedding, model_name, model_dim,
-                        token_count, source_file, chunk_index, modality)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                       (content, heading_path, content_hash, embedding_blob,
+                        model_name, model_dim, token_count, source_file,
+                        chunk_index, modality)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     rows,
                 )
                 conn.commit()
+
+        if progress_callback:
+            progress_callback(progress_offset + len(chunks), progress_offset + len(chunks))
 
         return len(chunks)
 
@@ -391,8 +489,11 @@ class VectorStore:
         # ── 加载所有向量 ──
         with self._lock:
             with self._conn() as conn:
+                # 兼容旧格式：优先使用 BLOB，fallback 到 JSON
                 rows = conn.execute(
-                    "SELECT * FROM rag_chunks ORDER BY id"
+                    "SELECT id, content, heading_path, embedding_blob, embedding, "
+                    "model_name, model_dim, token_count, source_file, chunk_index, "
+                    "modality FROM rag_chunks ORDER BY id"
                 ).fetchall()
 
         # ── 按维度分组 ──
@@ -430,13 +531,23 @@ class VectorStore:
                 if row_modality != modality_filter:
                     continue
 
-            stored = np.array(json.loads(row["embedding"]), dtype=np.float32)
+            # 读取向量：优先 BLOB，fallback JSON（向后兼容）
+            try:
+                if row["embedding_blob"] is not None:
+                    stored = np.frombuffer(row["embedding_blob"], dtype=np.float32)
+                elif row["embedding"]:
+                    stored = np.array(json.loads(row["embedding"]), dtype=np.float32)
+                else:
+                    continue
+            except (json.JSONDecodeError, TypeError, ValueError):
+                continue
+
             s_norm = float(np.linalg.norm(stored))
             if s_norm == 0:
                 continue
 
             sim = float(np.dot(query_arr, stored) / (q_norm * s_norm))
-            # 同模型微小加分（优先同模型的向量，但不显著扭曲余弦相似度排序）
+            # 同模型微小加分
             same_model = row["model_name"] == model_name
             adjusted = sim * (1.01 if same_model else 0.99)
 
@@ -462,7 +573,10 @@ class VectorStore:
         with self._lock:
             with self._conn() as conn:
                 conn.execute("DELETE FROM rag_chunks")
+                conn.execute("DELETE FROM embedding_cache")
                 conn.commit()
+                # 回收碎片空间
+                conn.execute("VACUUM")
 
     def clear_by_source(self, source_file: str):
         with self._lock:
