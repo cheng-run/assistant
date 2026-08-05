@@ -1,20 +1,22 @@
 """
 本地嵌入服务 + 向量存储
 
-嵌入引擎：fastembed（ONNX Runtime，无 PyTorch 依赖，AMD 友好）
-中文模型：BAAI/bge-small-zh-v1.5（512 维）
-英文模型：all-MiniLM-L6-v2（384 维）
+文本嵌入引擎：Ollama（OpenAI 兼容接口，本地 GPU 加速，默认 bge-m3 1024 维）
+  - 单模型中英通用，替代原 fastembed 双模型（bge-small-zh 512d / MiniLM 384d）
+图像嵌入引擎：fastembed CLIP（Qdrant/clip-ViT-B-32-vision，512 维，仍为 ONNX 本地）
 存储引擎：SQLite（向量以 BLOB 存储，含嵌入缓存表）
-检索算法：numpy 余弦相似度
+检索算法：numpy 批量余弦相似度
 """
 import hashlib
 import json
 import os
 import threading
+import time
 from pathlib import Path
 from typing import Dict, List, Optional
 
 import numpy as np
+from openai import OpenAI
 
 from memory.base import is_cjk
 
@@ -149,6 +151,132 @@ class LocalEmbedder:
             config["name"],
             config["dim"],
         )
+
+
+# ═══════════════════════════════════════════════════════════════
+#  Ollama 本地嵌入器（OpenAI 兼容接口，GPU 加速）
+# ═══════════════════════════════════════════════════════════════
+
+class OllamaEmbedder:
+    """
+    基于 Ollama OpenAI 兼容接口的本地文本嵌入器（单一模型，中英通用）。
+
+    默认模型 bge-m3（1024 维，多语言检索）。复用现有 openai 客户端，
+    无需新依赖。在 AMD GPU（Ollama ROCm）上运行，速度远快于 CPU。
+
+    用法:
+        embedder = OllamaEmbedder()
+        vec = embedder.embed("你好世界")
+        vecs, lang, name, dim = embedder.embed_with_model(["hello", "world"])
+    """
+
+    # 常见模型维度，命中即可避免首次探测的额外 HTTP 调用
+    _KNOWN_DIMS = {"bge-m3": 1024}
+
+    def __init__(
+        self,
+        model: str = None,
+        base_url: str = None,
+        timeout: float = 120.0,
+        max_retries: int = 3,
+        batch_size: int = 128,
+    ):
+        self.model = model or os.getenv("OLLAMA_EMBED_MODEL", "bge-m3")
+        self.base_url = base_url or os.getenv(
+            "OLLAMA_BASE_URL", "http://localhost:11434/v1"
+        )
+        self.timeout = timeout
+        self.max_retries = max_retries
+        self.batch_size = batch_size
+        self._client = OpenAI(
+            api_key="ollama",       # Ollama 忽略 key，占位即可
+            base_url=self.base_url,
+            timeout=self.timeout,
+        )
+        self._dim: Optional[int] = self._KNOWN_DIMS.get(self.model)
+
+    # ── 元信息 ──────────────────────────
+
+    @property
+    def model_name(self) -> str:
+        """模型名（与写入 DB 的 model_name 保持一致）"""
+        return self.model
+
+    @property
+    def dim(self) -> int:
+        """向量维度。已知模型直接返回；未知模型首次探测一次并缓存"""
+        if self._dim is None:
+            v = self.embed("dimension probe")
+            self._dim = len(v)
+        return self._dim
+
+    # ── 嵌入 ────────────────────────────
+
+    def embed(self, text: str, lang: str = None) -> List[float]:
+        """单条嵌入，返回 Python list[float]"""
+        result = self.embed_batch([text], lang=lang)
+        return result[0]
+
+    def embed_batch(
+        self, texts: List[str], lang: str = None
+    ) -> List[List[float]]:
+        """
+        批量嵌入（分块调用 Ollama /v1/embeddings，带指数退避重试）。
+
+        参数:
+            texts: 文本列表
+            lang:  语言参数（接口兼容，单一模型下忽略）
+        返回:
+            向量列表 List[List[float]]
+        """
+        if not texts:
+            return []
+
+        vectors: List[List[float]] = []
+        for start in range(0, len(texts), self.batch_size):
+            batch = texts[start:start + self.batch_size]
+            vectors.extend(self._embed_chunk(batch))
+
+        # 首次嵌入时缓存维度
+        if self._dim is None and vectors:
+            self._dim = len(vectors[0])
+
+        return vectors
+
+    def _embed_chunk(self, texts: List[str]) -> List[List[float]]:
+        """单块嵌入，带重试与友好错误提示"""
+        last_error = None
+        for attempt in range(self.max_retries):
+            try:
+                resp = self._client.embeddings.create(
+                    model=self.model,
+                    input=texts,
+                )
+                # 按 index 排序（防御：Ollama 默认按输入顺序返回）
+                data = sorted(resp.data, key=lambda d: getattr(d, "index", 0))
+                return [list(d.embedding) for d in data]
+            except Exception as e:
+                last_error = e
+                if attempt < self.max_retries - 1:
+                    time.sleep(2 ** attempt)  # 指数退避：1s → 2s → 4s
+
+        raise RuntimeError(
+            f"无法连接 Ollama 嵌入服务（{self.base_url}）。"
+            f"请确认已运行 'ollama serve' 且已拉取模型 'ollama pull {self.model}'。"
+        ) from last_error
+
+    def embed_with_model(
+        self, texts: List[str], lang: str = None
+    ) -> tuple:
+        """
+        嵌入并返回 (vectors, lang, model_name, dim)。
+        用于 VectorStore 记录模型信息。
+        """
+        if lang is None:
+            lang = detect_lang_batch(texts)  # 接口兼容，单一模型忽略
+        vectors = self.embed_batch(texts, lang=lang)
+        dim = len(vectors[0]) if vectors else (self._dim or 0)
+        return (vectors, lang, self.model, dim)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -294,6 +422,45 @@ class VectorStore:
             except Exception:
                 pass
 
+            # 迁移: 去掉 embedding 列的 NOT NULL 约束
+            # （向量现存 embedding_blob，embedding 列仅用于旧格式兼容，需允许 NULL）
+            try:
+                # SQLite 不能直接改列约束，重建表
+                conn.execute("PRAGMA foreign_keys=OFF")
+                conn.executescript("""
+                    BEGIN;
+                    CREATE TABLE rag_chunks_new (
+                        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                        content         TEXT    NOT NULL,
+                        heading_path    TEXT    DEFAULT '[]',
+                        embedding       TEXT    DEFAULT NULL,
+                        model_name      TEXT    DEFAULT '',
+                        model_dim       INTEGER DEFAULT 0,
+                        token_count     INTEGER DEFAULT 0,
+                        source_file     TEXT    DEFAULT '',
+                        chunk_index     INTEGER DEFAULT 0,
+                        modality        TEXT    DEFAULT 'text',
+                        created_at      TEXT    DEFAULT (datetime('now')),
+                        content_hash    TEXT    DEFAULT '',
+                        embedding_blob  BLOB    DEFAULT NULL
+                    );
+                    INSERT INTO rag_chunks_new (id, content, heading_path, embedding,
+                        model_name, model_dim, token_count, source_file, chunk_index,
+                        modality, created_at, content_hash, embedding_blob)
+                    SELECT id, content, heading_path, embedding, model_name, model_dim,
+                        token_count, source_file, chunk_index, modality, created_at,
+                        content_hash, embedding_blob
+                    FROM rag_chunks;
+                    DROP TABLE rag_chunks;
+                    ALTER TABLE rag_chunks_new RENAME TO rag_chunks;
+                    CREATE INDEX IF NOT EXISTS idx_rag_source ON rag_chunks(source_file);
+                    CREATE INDEX IF NOT EXISTS idx_rag_model ON rag_chunks(model_name);
+                    CREATE INDEX IF NOT EXISTS idx_rag_model_dim ON rag_chunks(model_dim);
+                    COMMIT;
+                """)
+            except Exception:
+                pass  # 已重建或无需迁移
+
             # ── 嵌入缓存表 ──
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS embedding_cache (
@@ -351,17 +518,41 @@ class VectorStore:
         for c in chunks:
             c["content_hash"] = self._content_hash(c.get("content", ""))
 
-        # ── Step 2: 检查嵌入缓存 ──
+        # ── Step 1.5: 分离预置向量（CLIP 页面向量等，跳过重新嵌入） ──
+        # 带非空 embedding 的 chunk 已由调用方预先嵌入（如 CLIP 图像向量），
+        # 其 model_name/model_dim 也由调用方标注，直接转 BLOB 存储。
+        preset_vectors = {}
+        text_indices = []
+        for i, c in enumerate(chunks):
+            if c.get("embedding") is not None:
+                vec = np.asarray(c["embedding"], dtype=np.float32)
+                preset_vectors[i] = (
+                    vec.tobytes(),
+                    c.get("model_name") or getattr(self.embedder, "model_name", ""),
+                    c.get("model_dim") or getattr(self.embedder, "dim", 0),
+                )
+            else:
+                text_indices.append(i)
+
+        # ── Step 2: 检查嵌入缓存（模型作用域） ──
         cache_hits = {}
         uncached_indices = []
+        cache_model = getattr(self.embedder, "model_name", None)
+        cache_dim = getattr(self.embedder, "dim", None)
+        has_model_scope = cache_model is not None and cache_dim is not None
         with self._lock:
             with self._conn() as conn:
-                for i, c in enumerate(chunks):
-                    row = conn.execute(
+                for i in text_indices:
+                    c = chunks[i]
+                    args = [c["content_hash"]]
+                    sql = (
                         "SELECT embedding, model_name, model_dim FROM embedding_cache "
-                        "WHERE content_hash = ?",
-                        (c["content_hash"],),
-                    ).fetchone()
+                        "WHERE content_hash = ?"
+                    )
+                    if has_model_scope:
+                        sql += " AND model_name = ? AND model_dim = ?"
+                        args += [cache_model, cache_dim]
+                    row = conn.execute(sql, tuple(args)).fetchone()
                     if row:
                         cache_hits[i] = (row["embedding"], row["model_name"], row["model_dim"])
                     else:
@@ -378,36 +569,42 @@ class VectorStore:
                 blob = np.array(vectors[idx], dtype=np.float32).tobytes()
                 new_vectors[i] = (blob, model_name, model_dim)
 
-            # 写入缓存
+            # 写入缓存（先清掉同内容旧模型条目，防止内容哈希撞键静默跳过缓存）
             with self._lock:
                 with self._conn() as conn:
+                    conn.executemany(
+                        "DELETE FROM embedding_cache WHERE content_hash = ? "
+                        "AND NOT (model_name = ? AND model_dim = ?)",
+                        [
+                            (chunks[i]["content_hash"], model_name, model_dim)
+                            for i in uncached_indices
+                        ],
+                    )
                     conn.executemany(
                         "INSERT OR IGNORE INTO embedding_cache "
                         "(content_hash, embedding, model_name, model_dim) "
                         "VALUES (?, ?, ?, ?)",
                         [
                             (chunks[i]["content_hash"], blob, model_name, model_dim)
-                            for idx, i in enumerate(uncached_indices)
+                            for i in uncached_indices
                         ],
                     )
                     conn.commit()
 
             lang = detected_lang
 
-        # ── Step 4: 合并缓存命中 + 新嵌入 ──
-        all_vectors = {}
-        for i in range(len(chunks)):
+        # ── Step 4: 合并预置向量 + 缓存命中 + 新嵌入（统一原始索引空间） ──
+        all_vectors = dict(preset_vectors)
+        for i in text_indices:
             if i in cache_hits:
                 all_vectors[i] = cache_hits[i]
             elif i in new_vectors:
                 all_vectors[i] = new_vectors[i]
 
-        # ── Step 5: 获取一致的 model info ──
         if not all_vectors:
             return 0
-        _, first_model_name, first_model_dim = next(iter(all_vectors.values()))
 
-        # ── Step 6: 写入数据库（BLOB 格式） ──
+        # ── Step 5: 写入数据库（BLOB 格式，每行用各自的模型信息） ──
         import sqlite3
         with self._lock:
             with self._conn() as conn:
@@ -417,14 +614,14 @@ class VectorStore:
                         json.dumps(chunks[i].get("heading_path", [])),
                         chunks[i]["content_hash"],
                         embedding_blob,
-                        first_model_name,
-                        first_model_dim,
+                        model_name,
+                        model_dim,
                         chunks[i].get("token_count", 0),
                         source_file or chunks[i].get("source_file", ""),
                         chunks[i].get("chunk_index", 0),
                         chunks[i].get("modality", "text"),
                     )
-                    for i, (embedding_blob, _, _) in all_vectors.items()
+                    for i, (embedding_blob, model_name, model_dim) in all_vectors.items()
                 ]
                 conn.executemany(
                     """INSERT INTO rag_chunks
@@ -486,86 +683,89 @@ class VectorStore:
             if q_norm == 0:
                 return []
 
-        # ── 加载所有向量 ──
+        # ── 加载同维度向量（文本路径按查询维度过滤；视觉路径用 CLIP 512d） ──
         with self._lock:
             with self._conn() as conn:
                 # 兼容旧格式：优先使用 BLOB，fallback 到 JSON
                 rows = conn.execute(
                     "SELECT id, content, heading_path, embedding_blob, embedding, "
                     "model_name, model_dim, token_count, source_file, chunk_index, "
-                    "modality FROM rag_chunks ORDER BY id"
+                    "modality FROM rag_chunks WHERE model_dim = ? ORDER BY id",
+                    (query_dim,),
                 ).fetchall()
 
-        # ── 按维度分组 ──
-        same_dim_rows = [r for r in rows if r["model_dim"] == query_dim]
-        other_rows = [r for r in rows if r["model_dim"] != query_dim]
+        if not rows:
+            return []
 
-        # 若无同维度向量，改用存量最多的模型重新 embed
-        if not same_dim_rows and other_rows:
-            from collections import Counter
-            dim_counts = Counter(r["model_dim"] for r in other_rows)
-            best_dim = dim_counts.most_common(1)[0][0]
-            # 找到该维度的模型名
-            fallback_lang = None
-            for lang, cfg in _MODEL_CONFIG.items():
-                if cfg["dim"] == best_dim:
-                    fallback_lang = lang
-                    break
-            if fallback_lang:
-                query_vec2, _, model_name, query_dim2 = self.embedder.embed_with_model(
-                    [query], lang=fallback_lang
-                )
-                query_arr = np.array(query_vec2[0], dtype=np.float32)
-                q_norm = float(np.linalg.norm(query_arr))
-                if q_norm == 0:
-                    return []
-                same_dim_rows = [r for r in rows if r["model_dim"] == query_dim2]
-                other_rows = [r for r in rows if r["model_dim"] != query_dim2]
+        # ── 一次 gather：向量 → 矩阵，元数据 → 并行列表（O(n) 无数学运算） ──
+        n = len(rows)
+        matrix = np.empty((n, query_dim), dtype=np.float32)
+        row_ids = np.empty(n, dtype=np.int64)
+        model_names = []
+        modalities = []
+        valid = np.ones(n, dtype=bool)
 
-        # ── 计算余弦相似度（仅同维度） ──
-        scored: List[Dict] = []
-        for row in same_dim_rows:
-            # 模态过滤
-            if modality_filter is not None:
-                row_modality = row["modality"] if "modality" in row.keys() else "text"
-                if row_modality != modality_filter:
-                    continue
-
-            # 读取向量：优先 BLOB，fallback JSON（向后兼容）
+        for idx, row in enumerate(rows):
             try:
                 if row["embedding_blob"] is not None:
                     stored = np.frombuffer(row["embedding_blob"], dtype=np.float32)
                 elif row["embedding"]:
                     stored = np.array(json.loads(row["embedding"]), dtype=np.float32)
                 else:
+                    valid[idx] = False
                     continue
             except (json.JSONDecodeError, TypeError, ValueError):
+                valid[idx] = False
                 continue
 
-            s_norm = float(np.linalg.norm(stored))
-            if s_norm == 0:
+            if stored.shape[0] != query_dim or stored.shape[0] == 0:
+                valid[idx] = False
                 continue
 
-            sim = float(np.dot(query_arr, stored) / (q_norm * s_norm))
-            # 同模型微小加分
-            same_model = row["model_name"] == model_name
-            adjusted = sim * (1.01 if same_model else 0.99)
+            matrix[idx] = stored
+            row_ids[idx] = row["id"]
+            model_names.append(row["model_name"])
+            modalities.append(row["modality"] if "modality" in row.keys() else "text")
 
-            if adjusted >= min_score:
-                scored.append({
-                    "id": row["id"],
-                    "content": row["content"],
-                    "heading_path": json.loads(row["heading_path"]),
-                    "score": round(adjusted, 4),
-                    "model_name": row["model_name"],
-                    "token_count": row["token_count"],
-                    "source_file": row["source_file"],
-                    "chunk_index": row["chunk_index"],
-                    "modality": row["modality"] if "modality" in row.keys() else "text",
-                })
+        # ── 批量余弦相似度 ──
+        norms = np.linalg.norm(matrix, axis=1)
+        valid &= norms > 0
+        sims = (matrix @ query_arr) / (q_norm * norms)
 
-        scored.sort(key=lambda x: x["score"], reverse=True)
-        return scored[:top_k]
+        # 同模型微小加分
+        same_model = np.array([mn == model_name for mn in model_names])
+        adjusted = sims * np.where(same_model, 1.01, 0.99)
+
+        # 模态过滤（page_image / text / ...）
+        if modality_filter is not None:
+            mod_arr = np.array(modalities)
+            valid &= mod_arr == modality_filter
+
+        # 无效项置为最低分（过滤掉零向量/坏行/模态不符）
+        adjusted[~valid] = -np.inf
+
+        # ── 稳定排序取 top_k（按分数降序，同分按 id 升序，与旧逻辑一致） ──
+        candidates = np.nonzero(adjusted >= min_score)[0]
+        if candidates.size == 0:
+            return []
+        order = candidates[np.lexsort((row_ids[candidates], -adjusted[candidates]))]
+
+        scored: List[Dict] = []
+        for idx in order[:top_k]:
+            row = rows[idx]
+            scored.append({
+                "id": row["id"],
+                "content": row["content"],
+                "heading_path": json.loads(row["heading_path"]),
+                "score": round(float(adjusted[idx]), 4),
+                "model_name": row["model_name"],
+                "token_count": row["token_count"],
+                "source_file": row["source_file"],
+                "chunk_index": row["chunk_index"],
+                "modality": row["modality"] if "modality" in row.keys() else "text",
+            })
+
+        return scored
 
     # ── 维护 ────────────────────────────
 

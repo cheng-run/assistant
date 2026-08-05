@@ -2,8 +2,12 @@
 RAG 文档处理工具
 
 文档 → Markdown → 标题分块 → Token 分块（自适应重叠）→ 向量嵌入 → 存储检索
+
+文本嵌入：Ollama 本地模型（默认 bge-m3，OpenAI 兼容接口，GPU 加速）
+图像嵌入：fastembed CLIP（视觉检索路径，保持不变）
 """
 import json
+import os
 import re
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -138,9 +142,10 @@ class RAGTool:
 
     @property
     def embedder(self):
+        """文本嵌入器：Ollama 本地模型（默认 bge-m3，OpenAI 兼容接口）"""
         if self._embedder is None:
-            from .embedding import LocalEmbedder
-            self._embedder = LocalEmbedder()
+            from .embedding import OllamaEmbedder
+            self._embedder = OllamaEmbedder()
         return self._embedder
 
     @property
@@ -153,17 +158,47 @@ class RAGTool:
 
     # ── 文档转换器懒加载 ─────────────────
 
+    def _new_pdf_converter(self, pipeline_options=None):
+        """
+        创建 Docling PDF 转换器（Windows 兼容配置）。
+
+        修复三个 Windows 下的已知问题:
+          1. docling-parse 的 C 扩展资源加载 bug（additional.dat 找不到）
+             → 改用 PyPdfiumDocumentBackend 后端
+          2. layout 模型加载遇 GBK 编码错误 → 需 PYTHONUTF8=1
+          3. torch.compile 需要 MSVC cl 编译器（Windows 通常没有）
+             → 通过 DOCLING_INFERENCE_COMPILE_TORCH_MODELS=false 关闭
+        """
+        # 确保 UTF-8（解决 docling 模型加载在 Windows GBK 编码下的崩溃）
+        os.environ["PYTHONUTF8"] = "1"
+        # 关闭 torch.compile（Windows 无 MSVC 时 torch.compile 会失败）
+        os.environ["DOCLING_INFERENCE_COMPILE_TORCH_MODELS"] = "false"
+
+        from docling.document_converter import DocumentConverter, PdfFormatOption
+        from docling.datamodel.base_models import InputFormat
+        from docling.datamodel.pipeline_options import PdfPipelineOptions
+        from docling.backend.pypdfium2_backend import PyPdfiumDocumentBackend
+
+        pipeline_options = pipeline_options or PdfPipelineOptions()
+        return DocumentConverter(
+            format_options={
+                InputFormat.PDF: PdfFormatOption(
+                    pipeline_options=pipeline_options,
+                    backend=PyPdfiumDocumentBackend,
+                )
+            }
+        )
+
     @property
     def _docling_converter(self):
-        """懒加载 Docling 文档转换器"""
+        """懒加载 Docling 文档转换器（PDF 走 PyPdfium 后端）"""
         if self.__docling_converter is None:
             try:
-                from docling.document_converter import DocumentConverter
+                self.__docling_converter = self._new_pdf_converter()
             except ImportError:
                 raise ImportError(
                     "处理文档需要 docling，请运行: uv add docling"
                 )
-            self.__docling_converter = DocumentConverter()
         return self.__docling_converter
 
     # ── 文档转换缓存 ──────────────────────
@@ -379,8 +414,6 @@ class RAGTool:
         返回: (page_paths: List[str], doc: DoclingDocument)
               返回 document 对象以避免重复转换
         """
-        from docling.document_converter import PdfFormatOption
-        from docling.datamodel.base_models import InputFormat
         from docling.datamodel.pipeline_options import PdfPipelineOptions
 
         # 配置页面图片生成
@@ -388,12 +421,7 @@ class RAGTool:
         pipeline_options.generate_page_images = True
         pipeline_options.images_scale = dpi
 
-        from docling.document_converter import DocumentConverter
-        img_converter = DocumentConverter(
-            format_options={
-                InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options)
-            }
-        )
+        img_converter = self._new_pdf_converter(pipeline_options)
         result = img_converter.convert(path)
         doc = result.document
 
@@ -406,7 +434,8 @@ class RAGTool:
         for page_no, page in doc.pages.items():
             if page.image is not None:
                 img_path = img_dir / f"{source_name}_p{page_no}.png"
-                page.image.save(str(img_path), "PNG")
+                pil_img = page.image.pil_image  # ImageRef → PIL Image
+                pil_img.save(str(img_path), "PNG")
                 page_paths.append(str(img_path))
 
         return page_paths, doc
@@ -488,6 +517,9 @@ class RAGTool:
                 "source_file": source_file,
                 "modality": "page_image",
                 "embedding": self.image_embedder.embed_image(pp),
+                # 预置向量的模型标识（VectorStore.add 会按此存 BLOB）
+                "model_name": self.image_embedder.model_name,
+                "model_dim": self.image_embedder.dim,
             })
 
         # ── Step 3: 检测含图表页（复用已转换的 doc，无需再转换） ──

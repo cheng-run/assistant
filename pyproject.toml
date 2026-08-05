@@ -1,0 +1,14 @@
+[project]
+name = "smart-doc-qa"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "docling>=2.118.0",
+    "fastembed>=0.8.0",
+    "gradio>=6.22.0",
+    "numpy>=2.5.1",
+    "openai>=2.53.0",
+    "python-dotenv>=1.2.2",
+]
