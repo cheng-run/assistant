@@ -514,6 +514,30 @@ class VectorStore:
         if not chunks:
             return 0
 
+        # 过滤近空 chunk（如图表轴标签碎片 "35,000"），避免检索噪音。
+        # 有效内容 = 去掉 [Context:]/[上文:] 前缀后的正文长度。
+        MIN_CONTENT_CHARS = 15
+
+        def _meaningful_len(text: str) -> int:
+            t = text or ""
+            if t.startswith("[Context:"):
+                end = t.find("]")
+                if end >= 0:
+                    t = t[end + 1:].lstrip("\n")
+            idx = t.rfind("[上文:")
+            if idx >= 0:
+                end = t.find("]", idx)
+                if end >= 0:
+                    t = t[end + 1:].lstrip("\n")
+            return len(t.strip())
+
+        chunks = [
+            c for c in chunks
+            if _meaningful_len(c.get("content", "")) >= MIN_CONTENT_CHARS
+        ]
+        if not chunks:
+            return 0
+
         # ── Step 1: 计算 content_hash ──
         for c in chunks:
             c["content_hash"] = self._content_hash(c.get("content", ""))

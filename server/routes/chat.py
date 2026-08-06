@@ -16,7 +16,10 @@ router = APIRouter()
 async def chat(body: ChatRequest):
     session = await store.get_session(body.session_id)
     if not session:
-        raise HTTPException(404, "会话不存在")
+        # 会话不存在 → 自动创建并继续聊天（幂等，避免前端陈旧 session_id 报 404）
+        session = await store.create_session_with_id(body.session_id)
+        if not session:
+            raise HTTPException(500, "创建会话失败")
 
     # 由 app.db 重建上下文（等效原 history[-40:]）
     history = [
@@ -56,6 +59,7 @@ async def chat(body: ChatRequest):
                     "answer": "".join(tokens),
                     "sources": sources,
                     "message_id": msg["id"],
+                    "session_id": body.session_id,
                 })
         except asyncio.CancelledError:
             # 客户端断开：持久化已累积的部分，不 yield（连接已断）

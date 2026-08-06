@@ -40,6 +40,14 @@ async def run_upload(path: str, fname: str, visual: bool, kg: bool):
                 "label": f"🧠 [4/4] 向量化 ({done}/{total})...",
             })
 
+        # 保存该文档的大纲（与 index() 行为一致），保证上传后结构可被引用
+        try:
+            outline = rag.extract_outline(markdown)
+            if outline:
+                rag._save_outline(fname, outline)
+        except Exception:
+            pass
+
         kg_note, visual_flag = "", False
 
         # 视觉索引（可选，仅 PDF）

@@ -50,7 +50,12 @@ export const useChatStore = defineStore("chat", () => {
   }
 
   async function sendMessage(text: string) {
-    const sid = sessionStore.currentId
+    let sid = sessionStore.currentId
+    if (!sid) {
+      // 防御：无会话时先自动创建
+      const s = await sessionStore.createSession()
+      sid = s.id
+    }
     if (!sid || streaming.value) return
     const trimmed = text.trim()
     if (!trimmed) return

@@ -60,9 +60,10 @@ def _ask_ollama_vlm(messages: list, model: str, max_retries: int = 3) -> str:
     last_error = None
     for attempt in range(max_retries):
         try:
-            # 组装 Ollama 原生消息：content 为纯文本，图片转 images 数组
+            # 组装 Ollama 原生消息：content 为纯文本，图片 base64 放入**每条含图消息内部**
+            # （Ollama /api/chat 要求 images 在 message 里，顶层 list-of-lists 会被忽略，
+            #   导致模型看不到图 —— 这是图表识别失效的根因）
             ollama_messages = []
-            images_by_turn: list[list[str]] = []
 
             for m in messages:
                 content = m.get("content")
@@ -78,22 +79,22 @@ def _ask_ollama_vlm(messages: list, model: str, max_retries: int = 3) -> str:
                                 imgs.append(url_data.split(",", 1)[1])
                         elif part.get("type") == "text":
                             text_parts.append(part.get("text", ""))
-                    ollama_messages.append({
+                    msg = {
                         "role": m.get("role", "user"),
                         "content": "\n".join(text_parts),
-                    })
-                    images_by_turn.append(imgs)
+                    }
+                    if imgs:
+                        msg["images"] = imgs  # ← 正确：图片随消息发送
+                    ollama_messages.append(msg)
                 else:
                     ollama_messages.append({
                         "role": m.get("role", "user"),
                         "content": content or "",
                     })
-                    images_by_turn.append([])
 
             body = {
                 "model": model,
                 "messages": ollama_messages,
-                "images": images_by_turn,
                 "stream": False,
             }
             req = urllib.request.Request(

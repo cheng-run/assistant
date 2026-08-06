@@ -449,13 +449,18 @@ class RAGTool:
         """
         visual_pages = set()
         for item, _ in doc.iterate_items():
-            page_no = getattr(item, "prov", [None])[0] if hasattr(item, "prov") else None
-            if page_no is None:
+            # item.label 是 DocItemLabel 枚举，需取 .value 与字符串比较
+            label = getattr(item, "label", None)
+            label_str = getattr(label, "value", "") if label is not None else ""
+            if label_str not in ("picture", "figure", "table"):
                 continue
-            label = getattr(item, "label", "")
-            if label in ("picture", "figure", "table"):
+            prov = getattr(item, "prov", None)
+            if not prov:
+                continue
+            # prov[0] 是 ProvenanceItem（不可哈希），页码在 .page_no
+            page_no = getattr(prov[0], "page_no", None)
+            if page_no is not None:
                 visual_pages.add(page_no)
-
         return visual_pages
 
     def _generate_page_description(self, image_path: str) -> str:
@@ -478,9 +483,9 @@ class RAGTool:
                 {
                     "type": "text",
                     "text": (
-                        "请客观描述这张文档页面中出现的图表、表格和关键视觉数据。"
-                        "列出具体数值、趋势和对比关系。只描述内容，不要评价。"
-                        "如果是纯文字页面，回复'纯文字页面，无图表'。"
+                        "这张页面经检测包含图表或图片。请详细描述图中内容："
+                        "图表类型、坐标轴/图例含义、关键数值、数据趋势与对比关系。"
+                        "列出你看到的具体数字和结论，只描述画面内容，不要评价，不要编造不存在的细节。"
                     ),
                 },
             ],
@@ -1509,16 +1514,46 @@ class RAGTool:
     def get_all_outlines(self) -> str:
         """
         获取所有已索引文档的大纲，拼接为紧凑的上下文块。
+
+        只返回向量库中真实存在的 source —— 即使大纲缓存残留了已删除文档的
+        旧条目，也不会再注入（清空文档后不会继续出现"幽灵"大纲）。
         """
         outlines = self._load_outlines()
         if not outlines:
             return ""
 
+        try:
+            active = set(self.vector_store.list_sources())
+        except Exception:
+            active = set(outlines.keys())
+
         parts = []
         for source, outline in outlines.items():
-            if outline.strip():
+            if source in active and outline.strip():
                 parts.append(f"[{source}]\n{outline}")
 
         if not parts:
             return ""
         return "## 已索引文档结构\n" + "\n\n".join(parts)
+
+    def clear_outlines(self) -> None:
+        """清空全部大纲缓存（配合向量库清空，避免残留旧文档结构）。"""
+        path = self._get_outline_path()
+        if path.exists():
+            try:
+                path.unlink()
+            except OSError:
+                pass
+
+    def remove_outline(self, source_file: str) -> None:
+        """从大纲缓存移除单个文档条目。"""
+        outlines = self._load_outlines()
+        if source_file not in outlines:
+            return
+        del outlines[source_file]
+        path = self._get_outline_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(outlines, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )

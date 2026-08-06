@@ -62,6 +62,20 @@ def _seed_retrieve(
     if not rag_enabled:
         return sys_msgs, sources
 
+    # 语料为空提示：避免 agent 反复调用空的检索工具
+    try:
+        if not rag.vector_store.list_sources():
+            sys_msgs.append({
+                "role": "system",
+                "content": (
+                    "（当前没有任何已索引文档。请如实告知用户尚未上传文档并引导其先上传，"
+                    "不要反复调用检索工具，直接给出简短的引导回答。）"
+                ),
+            })
+            return sys_msgs, sources
+    except Exception:
+        pass
+
     # 文档大纲注入（全局结构认知）
     try:
         outline_text = rag.get_all_outlines()
@@ -252,8 +266,8 @@ async def _stream_agent_events(
     except Exception as e:
         yield {"type": "error", "message": str(e)}
 
-    # 兜底综合（同原逻辑）
-    if not produced and fallback_messages:
+    # 兜底综合（同原逻辑）——注意用 is not None：空语料时 fallback_messages=[] 仍应兜底
+    if not produced and fallback_messages is not None:
         last_msgs = agent_input.get("messages") or []
         last = last_msgs[-1] if last_msgs else {}
         last_user = last.get("content", "") if isinstance(last, dict) else ""

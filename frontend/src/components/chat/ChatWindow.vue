@@ -29,15 +29,25 @@ const toggles = ref([
 async function ensureSession() {
   if (session.sessions.length === 0) await session.fetchSessions()
   if (!currentId.value) {
+    // 无有效会话 → 自动新建（用户可直接开始聊天）
     if (session.sessions.length > 0) {
       const first = session.sessions[0].id
       session.setCurrent(first)
       router.replace(`/s/${first}`)
+      return
     }
+    const s = await session.createSession()
+    router.replace(`/s/${s.id}`)
     return
   }
   session.setCurrent(currentId.value)
-  await chat.loadMessages(currentId.value)
+  try {
+    await chat.loadMessages(currentId.value)
+  } catch {
+    // 陈旧 currentId（会话已被删除）→ 自动新建并切换到新会话
+    const s = await session.createSession()
+    router.replace(`/s/${s.id}`)
+  }
 }
 
 onMounted(async () => {

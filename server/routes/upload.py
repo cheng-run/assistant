@@ -41,6 +41,7 @@ async def list_sources():
 @router.delete("/docs")
 async def clear_docs():
     rag.vector_store.clear()
+    rag.clear_outlines()  # 同步清大纲缓存，避免残留旧文档结构
     try:
         rag.kg_store.clear()
     except Exception:
@@ -51,4 +52,5 @@ async def clear_docs():
 @router.delete("/docs/{source}")
 async def remove_source(source: str):
     rag.vector_store.clear_by_source(source)
+    rag.remove_outline(source)  # 同步移除该文档的大纲条目
     return {"removed": True}

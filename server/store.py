@@ -51,13 +51,21 @@ class SessionStore:
         self._init()
 
     # ── 同步实现（私有）──────────────────────────
+    def _connect(self) -> sqlite3.Connection:
+        """打开连接并启用外键级联（否则 ON DELETE CASCADE 被 SQLite 忽略）。"""
+        conn = sqlite3.connect(self._db)
+        conn.execute("PRAGMA foreign_keys=ON")
+        return conn
+
     def _init(self) -> None:
-        with sqlite3.connect(self._db) as conn:
+        with self._connect() as conn:
             conn.execute("PRAGMA journal_mode=WAL")
             conn.executescript(SCHEMA)
+            # 清理历史遗留的孤儿消息（会话已删但消息残留）
+            conn.execute("DELETE FROM messages WHERE session_id NOT IN (SELECT id FROM sessions)")
 
     def _list_sessions_sync(self) -> list:
-        with sqlite3.connect(self._db) as c:
+        with self._connect() as c:
             rows = c.execute(
                 "SELECT id,title,created_at,updated_at FROM sessions ORDER BY updated_at DESC"
             ).fetchall()
@@ -67,7 +75,7 @@ class SessionStore:
         sid = uuid.uuid4().hex
         now = int(time.time() * 1000)
         title = (title or "新对话").strip() or "新对话"
-        with sqlite3.connect(self._db) as c:
+        with self._connect() as c:
             c.execute(
                 "INSERT INTO sessions (id,title,created_at,updated_at) VALUES (?,?,?,?)",
                 (sid, title, now, now),
@@ -75,19 +83,19 @@ class SessionStore:
         return {"id": sid, "title": title, "created_at": now, "updated_at": now}
 
     def _get_session_sync(self, sid: str) -> dict | None:
-        with sqlite3.connect(self._db) as c:
+        with self._connect() as c:
             row = c.execute(
                 "SELECT id,title,created_at,updated_at FROM sessions WHERE id=?", (sid,)
             ).fetchone()
         return _row_to_session(row) if row else None
 
     def _delete_session_sync(self, sid: str) -> None:
-        with sqlite3.connect(self._db) as c:
+        with self._connect() as c:
             c.execute("DELETE FROM sessions WHERE id=?", (sid,))
 
     def _rename_session_sync(self, sid: str, title: str) -> bool:
         now = int(time.time() * 1000)
-        with sqlite3.connect(self._db) as c:
+        with self._connect() as c:
             cur = c.execute(
                 "UPDATE sessions SET title=?, updated_at=? WHERE id=?",
                 (title, now, sid),
@@ -95,7 +103,7 @@ class SessionStore:
         return cur.rowcount > 0
 
     def _list_messages_sync(self, sid: str) -> list:
-        with sqlite3.connect(self._db) as c:
+        with self._connect() as c:
             rows = c.execute(
                 "SELECT id,session_id,role,content,sources,created_at "
                 "FROM messages WHERE session_id=? ORDER BY id",
@@ -116,7 +124,7 @@ class SessionStore:
     def _add_message_sync(self, sid: str, role: str, content: str, sources: list | None = None) -> dict:
         now = int(time.time() * 1000)
         src = json.dumps(sources, ensure_ascii=False) if sources is not None else None
-        with sqlite3.connect(self._db) as c:
+        with self._connect() as c:
             cur = c.execute(
                 "INSERT INTO messages (session_id,role,content,sources,created_at) VALUES (?,?,?,?,?)",
                 (sid, role, content, src, now),
@@ -134,7 +142,7 @@ class SessionStore:
 
     def _auto_title_sync(self, sid: str) -> None:
         """首条 user 消息截断 40 字作会话标题（若仍是默认标题）。"""
-        with sqlite3.connect(self._db) as c:
+        with self._connect() as c:
             row = c.execute(
                 "SELECT content FROM messages WHERE session_id=? AND role='user' ORDER BY id LIMIT 1",
                 (sid,),
@@ -144,7 +152,7 @@ class SessionStore:
             return
         title = row[0].strip().replace("\n", " ")[:40]
         if title:
-            with sqlite3.connect(self._db) as c:
+            with self._connect() as c:
                 c.execute("UPDATE sessions SET title=? WHERE id=?", (title, sid))
 
     # ── 异步门面（public）──────────────────────
@@ -153,6 +161,20 @@ class SessionStore:
 
     async def create_session(self, title: str | None = None) -> dict:
         return await asyncio.to_thread(self._create_session_sync, title)
+
+    def _create_session_with_id_sync(self, sid: str, title: str | None) -> dict | None:
+        """按指定 id 创建会话（幂等：已存在则直接返回）。"""
+        now = int(time.time() * 1000)
+        title = (title or "新对话").strip() or "新对话"
+        with self._connect() as c:
+            c.execute(
+                "INSERT OR IGNORE INTO sessions (id,title,created_at,updated_at) VALUES (?,?,?,?)",
+                (sid, title, now, now),
+            )
+        return self._get_session_sync(sid)
+
+    async def create_session_with_id(self, sid: str, title: str | None = None) -> dict | None:
+        return await asyncio.to_thread(self._create_session_with_id_sync, sid, title)
 
     async def get_session(self, sid: str) -> dict | None:
         return await asyncio.to_thread(self._get_session_sync, sid)
