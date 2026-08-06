@@ -9,7 +9,7 @@
 **一句话**：一个基于 RAG（检索增强生成）的智能文档问答系统，支持上传 PDF/DOCX/TXT/MD 文档，通过向量检索 + 知识图谱 + 视觉理解三种增强手段，让大模型基于文档内容给出带引用的回答，并内置了模拟人类记忆机制的对话记忆系统。
 
 **技术亮点**（面试时优先讲这 4 个）：
-1. **RAG 全流程自建**：文档解析 → 标题分块 → Token 分块 → 本地向量化（Ollama + AMD GPU）→ SQLite 向量检索，没有用 LangChain 全家桶，核心逻辑手写。
+1. **RAG 全流程自建**：文档解析 → 标题分块 → Token 分块 → 本地向量化（Ollama + AMD GPU）→ SQLite 向量检索，检索核心手写；重构后在其上加了一层 LangChain/LangGraph/Deep Agents 编排（见第八节），形成"手写引擎 + 框架编排"两段式架构。
 2. **双层认知记忆系统**：模拟人类记忆，短期工作记忆 + 长期情景记忆，带重要性路由、混合检索、三种遗忘策略、自动整合。
 3. **知识图谱增强检索**：LLM 提取实体关系 → Louvain 社区检测 → 社区摘要 → 图检索与向量检索融合，提升结构化问答能力。
 4. **多模态视觉检索**：CLIP 图像嵌入 + 本地 Qwen VL 大模型解读图表，让 PDF 里的图表信息也能被检索和回答。
@@ -23,8 +23,10 @@
 ### 技术栈
 | 层 | 技术 | 说明 |
 |---|---|---|
-| WebUI | Gradio | Python 原生 Web 框架，流式对话 |
-| LLM 对话 | DeepSeek API | OpenAI 兼容接口 |
+| 前端 WebUI | Vue 3 + TypeScript + Naive UI | Vite 构建，SSE 流式对话（暗色主题）|
+| 后端 API | FastAPI + uvicorn | SSE 流式、会话管理、上传索引 |
+| Agent 编排 | LangChain + LangGraph + Deep Agents | 工具调用 / ReAct / 规划子代理 |
+| LLM 对话 | DeepSeek API | OpenAI 兼容接口（agent 主模型）|
 | 文本嵌入 | Ollama `bge-m3`（1024 维） | 本地 GPU 推理，AMD RX 9070 |
 | 图像嵌入 | fastembed CLIP | ONNX CPU 本地推理 |
 | 视觉理解 | Ollama `qwen3-vl:4b` | 本地图表/表格理解 |
@@ -37,9 +39,16 @@
 
 ```
 ┌─────────────────────────────────────────────────────────┐
-│                    Gradio WebUI (app.py)                │
-│   上传文档 │ RAG开关 │ 视觉开关 │ 图谱开关 │ 流式对话    │
+│              Vue 3 + Naive UI 前端 (frontend/)          │
+│   多会话侧栏 │ 上传文档 │ RAG/视觉/图谱开关 │ SSE 流式   │
 └──────────────────────┬──────────────────────────────────┘
+                       │ /api (SSE / JSON)
+                       ▼
+              ┌─────────────────────┐
+              │ FastAPI 后端 (server/)│
+              │ chat / upload /      │
+              │ sessions / docs      │
+              └──────────┬──────────┘
                        │
         ┌──────────────┼───────────────┐
         ▼              ▼               ▼
@@ -62,7 +71,7 @@
 ```
 
 ### 核心设计理念
-- **自建而非堆框架**：向量存储、检索算法、社区检测都是手写实现，理解更深、可控性更强，也是面试加分点。
+- **自建而非堆框架（引擎层）**：向量存储、检索算法、社区检测都是手写实现，理解更深、可控性更强；编排层（`agent/`）引入 LangChain/LangGraph/Deep Agents（见第八节），两段式架构兼顾理解深度与工程化能力。
 - **混合检索**：不依赖单一信号，TF-IDF 语义 + 关键词 + 时间衰减 + 重要性加权。
 - **本地化部署**：嵌入和视觉理解走本地 GPU，只有主对话走 API，兼顾成本、隐私与质量。
 
@@ -332,8 +341,8 @@ A：三点——向量化检索（numpy 矩阵运算）、嵌入缓存（内容�
 **Q21：如果 Ollama 挂了怎么办？**
 A：三个层面降级：主对话走 DeepSeek 不受影响；嵌入失败有明确报错（提示 `ollama serve`/`ollama pull`）；KG 检索失败自动回退纯向量。视觉索引失败也不影响文本路径。整体设计是"增强项挂了，基础功能不瘫"。
 
-**Q22：为什么用 Gradio？**
-A：Python 原生、流式输出开箱即用、几行代码出 WebUI，适合快速验证和 Demo。生产化可换 FastAPI/前端框架，`learning_FastAPI` 项目里有相关实践。
+**Q22：为什么最终从 Gradio 换成了 FastAPI + Vue？**
+A：最初用 Gradio 是图它 Python 原生、流式输出开箱即用，适合快速验证。但 Gradio 6.22 与 langgraph 1.2.x 存在 websockets 版本冲突（gradio 需 ≥16、langgraph 钉 <16），导致启动握手挂起。所以前端重构为 **Vue 3 + TS + Naive UI**、后端用 **FastAPI 封装 agent 编排层**，根治冲突的同时拿到了真正的产品级前端：多会话、SSE 流式、来源卡片、暗色主题。这也把"编排层"变成了可独立测试的 HTTP 服务（见第八、九节）。
 
 ---
 
@@ -343,7 +352,7 @@ A：Python 原生、流式输出开箱即用、几行代码出 WebUI，适合快
 诚实回答：知识图谱的社区层级没做完（Louvain 只实现了 Phase 1），所以图谱是单层的，检索粒度受限；另外 chunk↔实体的引用层（kg_chunk_entity_refs）设计好了但没接线，导致"图谱 → 证据 chunk"的跳转能力没真正启用。这两块是明确的下一步：补 Phase 2 层级 + 接线 chunk 引用，让图谱既能给结构也能给原文证据。
 
 **追问 2：为什么不直接用现成的 RAG 框架（LangChain/LlamaIndex）？**
-回答：这个项目是学习 + 实战性质，**手写核心逻辑能让我真正理解 RAG 的每个环节**——分块、向量化、检索、融合——而不是当框架的"调包侠"。框架封装了太多细节，出了问题难排查。当然，框架有成熟的生态（工具链、评估、部署），生产项目会用框架或自研 hybrid，这个项目证明了基础能力。
+回答：分两层看。**检索引擎**（分块、向量化、检索、融合）是这个项目的核心学习资产，手写能让我真正理解每个环节——这部分刻意不依赖框架。**编排层**（第八节）则在重构时引入了 LangChain/LangGraph/Deep Agents：把手写检索引擎包装成 agent 工具，再叠上 ReAct 循环、规划、子代理、MCP 与 checkpoint 持久化。这样既证明了基础能力（手写引擎），又展示了生产级工程能力（框架编排），是"自研核心 + 框架组合"的两段式架构。
 
 **追问 3：重要性的赋值是规则不是学习，会不会太简单？**
 承认这是权衡：规则零成本、可解释、稳定；但不够自适应。可改进：用 LLM 动态打分，或用 RL 根据"回答是否成功"回馈调整。
@@ -383,6 +392,113 @@ Louvain 增益 = k_i_in/2m - resolution × Σtot × k_i/(2m²)
 
 ### 简历一句话项目描述（可直接用）
 > **智能文档问答助手**（后端/AI 方向）：自建 RAG 文档问答系统，含文档解析、两级分块、Ollama+bge-m3 本地向量化、SQLite 向量检索、知识图谱增强（Louvain 社区 + LLM 摘要）、多模态视觉检索（CLIP + Qwen VL 本地图表理解）与双层认知记忆（重要性路由 + 混合检索 + 三种遗忘策略）。主对话接 DeepSeek，嵌入/视觉本地 AMD GPU 推理，numpy 向量化检索优化。
+
+---
+
+## 八、Agent 编排层（LangChain + LangGraph + Deep Agents 重构记录）
+
+> 阶段 B/C 引入的编排层。核心立场：**手写 RAG 引擎一个字节不动，框架只做编排** ——
+> 这不是推翻"手写核心逻辑"的初衷，而是把它升级成"**手写引擎 + 框架编排**"两层架构，
+> 让引擎（检索质量）与编排（agent 能力）各司其职。面试叙事反而更强：你既懂每个 RAG 环节的细节，又能用生产级框架组装 agent。
+
+### 8.1 三层分工
+
+| 层 | 框架 | 职责 | 对应模块 |
+|---|---|---|---|
+| 工具层 | LangChain | 把 `RAGTool`/`MemoryTool` 包装成 agent 可调用工具；DeepSeek 模型接入 | `agent/tools.py` `agent/models.py` |
+| 运行时 | LangGraph | ReAct 循环（model↔tools 节点）、状态、流式、checkpoint 持久化 | `agent/graph.py` |
+| Harness | Deep Agents | 规划（`write_todos`）、子代理委派（`task`）、上下文压缩 | `agent/deep.py` |
+
+MCP 层：`agent/mcp.py` 用 `langchain-mcp-adapters` 消费外部 MCP server 工具（本应用是 MCP 客户端）。
+
+### 8.2 关键设计决策
+
+1. **一个富工具而非四个散工具**：`search_documents(query, top_k, mode)`，`mode ∈ {vector, kg, expanded, visual}`
+   由 UI 开关决定，用 pydantic `Literal` 在 **schema 层**禁止非法 mode —— 减少模型做工具选择的失败率。
+2. **确定性种子检索（hybrid）**：`agent/service.py::_build_seed_system_messages` 把重构前的上下文拼装
+   逻辑原样搬迁，作为兜底上下文注入 —— **即使 flash 模型工具调用失败，回答质量也不下坠**。
+3. **记忆子系统终于上线**：`memory/` built-but-never-wired，现在通过 `memory_recall`/`memory_remember`
+   两个工具接入，并随种子注入长期记忆。
+4. **流式只展示模型文本**：`messages` 流过滤工具结果回显（AIMessageChunk 才计入答案），
+   agent 只调工具没产出回答时自动用种子做兜底综合。
+5. **开关 → 工具集映射**：RAG 关 → 整个移除 `search_documents`（退化为纯聊天）；KG/视觉开 → 允许对应 mode。
+
+### 8.3 运行时切换（.env 新增，全部可选）
+
+```
+AGENT_MODE=reactive     # legacy=旧手写路径 / reactive=LangGraph agent(默认) / deep=Deep Agents
+ENABLE_CHECKPOINT=0     # 1=启用 langgraph-checkpoint-sqlite 多轮持久化（data_db/agent_checkpoints.db）
+USE_LANGCHAIN=0         # 仅 legacy 模式下：1=用 ChatOpenAI 代替原生 SDK 流式
+MCP_SERVERS_JSON=...    # 可选：接入外部 MCP server 工具；不设则完全 no-op
+```
+
+### 8.4 为什么保留手写 RAG（诚实说明）
+
+- 自研分块（heading_path + 自适应重叠）、Louvain 社区摘要检索、CLIP 视觉融合在 LangChain 生态**没有现成等价物**，
+  重写必然质量回退。
+- 重构采用 **Strangler Fig 渐进式**：五阶段（依赖基线→薄适配→LangGraph→Deep Agents→MCP）每步可运行、可验证、可回滚。
+- 金集回归（`tests/golden.jsonl` + `tests/run_golden.py`）对比旧/新路径的检索 P@3、回答忠实度、延迟与 token 成本。
+
+### 8.5 金集回归用法
+
+```bash
+uv run --env-file .env python -m tests.run_golden --retrieve-only            # 只测检索 P@3
+uv run --env-file .env python -m tests.run_golden --paths legacy,reactive    # 对比旧/新回答
+uv run --env-file .env python -m tests.run_golden --paths deep --judge       # Deep Agents + LLM 裁判
+```
+
+---
+
+## 九、FastAPI 后端 + Vue 3 前端（弃用 Gradio）
+
+> 前端重构记录。Gradio 6.22 与 langgraph 1.2.x 存在 websockets 版本冲突导致启动握手挂起，
+> 故弃用 Gradio，改为 **FastAPI 封装 agent 编排层 + Vue 3/TS/Naive UI 前端**，同时根治该依赖冲突。
+
+### 9.1 架构分层
+
+```
+frontend/ (Vue 3 + TS + Vite + Naive UI)     ← 多会话侧栏 + 流式聊天 + 来源卡片
+    │  /api/*  (dev: Vite proxy → :8000; 生产: FastAPI 托管 dist)
+    ▼
+server/ (FastAPI)
+    ├─ POST /api/chat     SSE: status/source/token/done/error
+    ├─ POST /api/upload   SSE: stage/progress/result
+    ├─ POST /api/sessions 会话 CRUD + 消息持久化 (data_db/app.db)
+    ├─ GET  /api/docs/sources | DELETE /api/docs | DELETE /api/docs/{src}
+    └─ GET  /api/config   agent模式/模型/开关（只读）
+    ▼
+agent/service.py  stream_events() 结构化事件流（source 卡片 + status/token）
+    ▼
+rag/ + memory/ + llm.py  （检索引擎，不动）
+```
+
+### 9.2 关键设计
+
+- **SSE 结构化事件流**：`agent/service.py::stream_events` yield `{type: status|source|token|error}`，
+  由 `server/routes/chat.py` 转发为标准 SSE 帧；`stream_chat` 保留为 Gradio 兼容薄适配器，
+  **金集回归零改动**。
+- **多会话**：`data_db/app.db`（SQLite WAL）存会话/消息；`session_id` 作为
+  langgraph checkpoint 的 `thread_id`（`ENABLE_CHECKPOINT=1` 时启用 agent 内部记忆）。
+- **上传**：`UploadFile` 分块写盘 → 复用 RAGTool 流水线 → SSE 进度（阻塞调用全走 `to_thread`）。
+- **前端**：Vue 3 + TS + Naive UI（暗色默认、Fraunces/Manrope/JetBrains Mono 字体、
+  品牌蓝点缀、来源卡片=引文脚注、agent 状态行=过程批注）。
+
+### 9.3 运行
+
+```bash
+# 一键启动（生产）：构建前端 + 启动 + 自动打开浏览器（无 .bat，跨平台）
+uv run --env-file .env python launch.py
+
+# 开发模式（前端热更新）：先 `cd frontend && npm run dev`（:5173），
+# 后端另开终端 `uv run --env-file .env uvicorn server.main:app --reload`（:8000）
+```
+
+### 9.4 已知取舍（诚实说明）
+
+- **deep 模式波动**：Deep Agents + flash 模型在简单事实题上偶发不稳（把检索片段当用户输入）。
+  reactive（默认）稳定 5.0 分；deep 适合复杂多跳问题，简单题建议用 reactive。
+- **来源卡片仅覆盖种子检索**：agent 工具内的二次检索返回文本不解析为结构化卡片。
+- 依赖：移除 gradio 后 websockets 回落 15.0.1（langgraph 约束），无冲突。
 
 ---
 

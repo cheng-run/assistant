@@ -1,0 +1,11 @@
+{"id": 1, "question": "AI 的中文全称是什么？它属于哪个领域？", "mode": "vector", "bucket": "factual", "expected_headings": ["文档"], "notes": "术语表：AI=人工智能，计算机科学领域"}
+{"id": 2, "question": "AIGC 的中文全称是什么？它是哪个学科的分支？", "mode": "vector", "bucket": "factual", "expected_headings": ["文档"], "notes": "术语表：AIGC=生成式人工智能，机器学习分支"}
+{"id": 3, "question": "AGI 指什么？它目前处于什么阶段？", "mode": "vector", "bucket": "factual", "expected_headings": ["文档"], "notes": "术语表：AGI=通用人工智能，理论研究阶段"}
+{"id": 4, "question": "AIGC 可以创造哪些类型的新内容？", "mode": "vector", "bucket": "factual", "expected_headings": ["文档"], "notes": "对话、故事、图片、视频、音乐"}
+{"id": 5, "question": "ChatGPT 和 Sora 分别是什么技术的应用？", "mode": "vector", "bucket": "factual", "expected_headings": ["文档"], "notes": "均为 AIGC 应用"}
+{"id": 6, "question": "AI 的目标是什么？", "mode": "vector", "bucket": "factual", "expected_headings": ["文档"], "notes": "建立能从资料中取得有用知识的自学习系统"}
+{"id": 7, "question": "AGI 具备哪些能力？", "mode": "vector", "bucket": "factual", "expected_headings": ["文档"], "notes": "自主自控、自我理解、学习新技能、推理、决策"}
+{"id": 8, "question": "机器学习在知识图谱中与 AI、AIGC 分别是什么关系？", "mode": "kg", "bucket": "relational", "expected_headings": ["文档"], "notes": "AIGC→属于→机器学习→属于→AI"}
+{"id": 9, "question": "Sora 在知识图谱中被归类为应用了什么技术？", "mode": "kg", "bucket": "relational", "expected_headings": ["文档"], "notes": "Sora→应用了→AIGC"}
+{"id": 10, "question": "已索引的文档共有哪些？", "mode": "outline", "bucket": "structural", "expected_headings": ["文档"], "notes": "list_sources: test.pdf"}
+{"id": 11, "question": "请总结一下文档的主要内容", "mode": "vector", "bucket": "summarize", "expected_headings": ["文档"], "notes": "AI/AIGC/AGI 术语表"}

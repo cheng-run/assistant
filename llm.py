@@ -117,7 +117,7 @@ def ask_llm(messages: list = None, question: str = None, max_retries: int = 3, m
 
     自动检测视觉消息（content 为 list 的格式）：
       - 配置了 OLLAMA_VLM_MODEL → 路由到本地 Ollama 视觉模型（如 qwen VL）
-      - 未配置 → 使用 deepseek-v4-pro 模型（保持原行为）
+      - 未配置 → 使用 DEEPSEEK_MODEL_NAME（当前为 flash）
     纯文本消息始终走 DeepSeek。
     """
     if messages is None:
@@ -140,7 +140,7 @@ def ask_llm(messages: list = None, question: str = None, max_retries: int = 3, m
         if use_ollama_vlm:
             model = vlm_model
         elif has_vision:
-            model = "deepseek-v4-pro"
+            model = os.getenv("DEEPSEEK_MODEL_NAME")  # 与纯文本对话统一（当前为 flash）
         else:
             model = os.getenv("DEEPSEEK_MODEL_NAME")
 
