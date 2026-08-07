@@ -34,7 +34,7 @@ async def chat(body: ChatRequest):
         try:
             async for ev in stream_events(
                 body.message, history,
-                body.rag_enabled, body.visual_enabled, body.kg_enabled,
+                body.rag_enabled,
                 body.session_id,
             ):
                 t = ev["type"]

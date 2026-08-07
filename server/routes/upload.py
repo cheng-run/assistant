@@ -15,19 +15,15 @@ _UPLOAD_DIR = Path(__file__).resolve().parent.parent.parent / "data_db" / "uploa
 
 
 @router.post("/upload")
-async def upload(
-    file: UploadFile = File(...),
-    visual: bool = Form(False),
-    kg: bool = Form(False),
-):
-    """接收文件 → 分块写盘（不占内存）→ SSE 进度流。"""
+async def upload(file: UploadFile = File(...)):
+    """接收文件 → 分块写盘（不占内存）→ SSE 进度流（视觉/KG 自动）。"""
     _UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
     fname = (file.filename or "upload").replace("\\", "/").split("/")[-1]
     dest = _UPLOAD_DIR / f"{uuid.uuid4().hex}_{fname}"
     with dest.open("wb") as f:
         while chunk := await file.read(1 << 20):  # 1MB 分块
             f.write(chunk)
-    return event_stream(run_upload(str(dest), fname, visual, kg))
+    return event_stream(run_upload(str(dest), fname))
 
 
 @router.get("/docs/sources")

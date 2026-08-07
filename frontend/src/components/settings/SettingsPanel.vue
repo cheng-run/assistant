@@ -34,16 +34,8 @@ async function clearDocs() {
       <div class="setting-group">
         <div class="group-title">检索开关</div>
         <div class="setting-row">
-          <div class="setting-label">RAG 检索<span class="hint">基于文档内容回答</span></div>
+          <div class="setting-label">文档问答<span class="hint">基于文档内容回答（视觉/图谱自动路由）</span></div>
           <n-switch :value="settings.ragEnabled" @update:value="settings.setRag" />
-        </div>
-        <div class="setting-row">
-          <div class="setting-label">视觉检索<span class="hint">CLIP + Qwen VL 图表理解</span></div>
-          <n-switch :value="settings.visualEnabled" @update:value="settings.setVisual" />
-        </div>
-        <div class="setting-row">
-          <div class="setting-label">知识图谱<span class="hint">实体关系增强检索</span></div>
-          <n-switch :value="settings.kgEnabled" @update:value="settings.setKg" />
         </div>
       </div>
 

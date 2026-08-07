@@ -20,10 +20,9 @@ const currentId = computed(() => (route.params.id as string) || session.currentI
 const hasSession = computed(() => !!currentId.value)
 const currentTitle = computed(() => session.sessions.find((s) => s.id === currentId.value)?.title ?? "")
 
+// 视觉/图谱检索由后端路由引擎自动决策（按问题类型组合），前端只留"文档问答"总开关
 const toggles = ref([
-  { key: "rag", label: "RAG", get: () => settings.ragEnabled, set: settings.setRag },
-  { key: "visual", label: "视觉", get: () => settings.visualEnabled, set: settings.setVisual },
-  { key: "kg", label: "图谱", get: () => settings.kgEnabled, set: settings.setKg },
+  { key: "rag", label: "文档问答", get: () => settings.ragEnabled, set: settings.setRag },
 ])
 
 async function ensureSession() {

@@ -664,6 +664,36 @@ class VectorStore:
 
     # ── 检索 ────────────────────────────
 
+    def get_by_ids(self, ids: List[int]) -> List[Dict]:
+        """按 id 批量取 chunk（供知识图谱证据跳转 / 其它按 id 取原文的场景）。"""
+        if not ids:
+            return []
+        placeholders = ",".join("?" * len(ids))
+        with self._lock:
+            with self._conn() as conn:
+                rows = conn.execute(
+                    f"SELECT id, content, heading_path, score, source_file, "
+                    f"chunk_index, modality FROM rag_chunks "
+                    f"WHERE id IN ({placeholders})",
+                    list(ids),
+                ).fetchall()
+        out = []
+        for r in rows:
+            try:
+                hp = json.loads(r[2]) if r[2] else []
+            except Exception:
+                hp = []
+            out.append({
+                "id": r[0],
+                "content": r[1],
+                "heading_path": hp,
+                "score": r[3],
+                "source_file": r[4],
+                "chunk_index": r[5],
+                "modality": r[6],
+            })
+        return out
+
     def search(
         self, query: str, top_k: int = 5, min_score: float = 0.0,
         modality_filter: str = None, image_embedder=None,

@@ -15,8 +15,11 @@
 
 import asyncio
 import os
+import threading
+import time
 from typing import AsyncGenerator, Dict, List, Optional, Tuple
 
+from agent.router import multi_retrieve, route_query
 from agent.tools import mem, rag
 from memory.base import extract_text
 
@@ -27,6 +30,23 @@ _AGENT_CACHE: Dict[tuple, object] = {}
 
 _DB_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data_db")
 
+# 记忆自动维护节流（低频后台线程，不阻塞请求）
+_seed_call_count = 0
+_last_maintain_ts = 0.0
+
+
+def _maybe_auto_maintain() -> None:
+    """后台线程执行记忆整合/遗忘（至少间隔 60s，每 5 次种子检索触发一次）。"""
+    global _last_maintain_ts
+    now = time.time()
+    if now - _last_maintain_ts < 60:
+        return
+    _last_maintain_ts = now
+    try:
+        threading.Thread(target=mem.auto_maintain, daemon=True).start()
+    except Exception:
+        pass
+
 
 # ═══════════════════════════════════════════════════════════════
 #  确定性种子检索
@@ -35,26 +55,39 @@ _DB_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 def _seed_retrieve(
     message: str,
     rag_enabled: bool,
-    visual_enabled: bool,
-    kg_enabled: bool,
+    modes: Optional[Tuple[str, ...]] = None,
 ) -> Tuple[List[Dict], List[Dict]]:
-    """构建"确定性种子"系统消息 + 结构化来源片段。
+    """构建"确定性种子"系统消息 + 结构化来源片段（自动路由）。
 
     返回 (sys_msgs, sources)：
-      - sys_msgs: 送给 agent 的系统消息（长期记忆 + 大纲 + 文档片段/图谱）
+      - sys_msgs: 送给 agent 的系统消息（长期/工作记忆 + 大纲 + 检索片段/图谱）
       - sources:  检索片段的结构化表示，供前端"来源卡片"事件
     """
+    global _seed_call_count
+    _seed_call_count += 1
+    if _seed_call_count % 5 == 0:
+        _maybe_auto_maintain()
+
     sys_msgs: List[Dict] = []
     sources: List[Dict] = []
 
-    # 长期记忆注入（让沉睡的 memory/ 子系统在 UI 上生效）
+    # 长期记忆 + 工作记忆注入（让 memory/ 子系统在 UI 上生效）
     try:
-        memory_ctx = mem.get_relevant_context(message, limit=3)
-        if memory_ctx:
-            lines = "\n".join(f"- {extract_text(c['content'])}" for c in memory_ctx)
+        memory_lines = []
+        for c in mem.get_relevant_context(message, limit=3):
+            memory_lines.append(f"- [长期] {extract_text(c['content'])}")
+        try:
+            for c in mem.get_working()[:3]:
+                memory_lines.append(f"- [近期] {extract_text(c.get('content', ''))}")
+        except Exception:
+            pass
+        if memory_lines:
             sys_msgs.append({
                 "role": "system",
-                "content": f"【系统资料】以下是系统检索到的与用户相关的历史记忆（非本次用户输入）：\n{lines}",
+                "content": (
+                    "【系统资料】以下是系统检索到的与用户相关的历史记忆（非本次用户输入）：\n"
+                    + "\n".join(memory_lines)
+                ),
             })
     except Exception:
         pass
@@ -87,16 +120,14 @@ def _seed_retrieve(
     except Exception:
         pass
 
-    # RAG 上下文注入
+    # 自动路由：意图 → 策略 → 多路检索（可显式指定 modes 供测试/金集）
     try:
-        if kg_enabled:
-            kg_context, chunks = rag.retrieve_with_kg(
-                message, top_k=3, enable_visual=visual_enabled
-            )
-            if kg_context:
-                sys_msgs.append({"role": "system", "content": kg_context})
-        else:
-            chunks = rag.retrieve(message, top_k=3, enable_visual=visual_enabled)
+        if modes is None:
+            _intent, strategy = route_query(message)
+            modes = strategy.modes
+        chunks, kg_context = multi_retrieve(rag, message, modes, top_k=3)
+        if kg_context:
+            sys_msgs.append({"role": "system", "content": kg_context})
     except Exception:
         sys_msgs.append({
             "role": "system",
@@ -136,11 +167,11 @@ def _seed_retrieve(
 def _build_seed_system_messages(
     message: str,
     rag_enabled: bool,
-    visual_enabled: bool,
-    kg_enabled: bool,
+    visual_enabled: bool = False,
+    kg_enabled: bool = False,
 ) -> List[Dict]:
-    """兼容层：只返回系统消息（旧调用面 / 测试仍可用）。"""
-    sys_msgs, _ = _seed_retrieve(message, rag_enabled, visual_enabled, kg_enabled)
+    """兼容层：只返回系统消息（旧调用面 / 测试仍可用，visual/kg 已由路由接管）。"""
+    sys_msgs, _ = _seed_retrieve(message, rag_enabled)
     return sys_msgs
 
 
@@ -148,32 +179,29 @@ def _build_seed_system_messages(
 #  agent 构建
 # ═══════════════════════════════════════════════════════════════
 
-def _memo_key(rag_enabled: bool, visual_enabled: bool, kg_enabled: bool) -> tuple:
-    return (bool(rag_enabled), bool(visual_enabled), bool(kg_enabled))
+def _memo_key(rag_enabled: bool) -> tuple:
+    return (bool(rag_enabled),)
 
 
-def _get_agent(rag_enabled: bool, visual_enabled: bool, kg_enabled: bool):
-    """获取（缓存）按开关组合构建的 LangGraph agent。"""
+def _get_agent(rag_enabled: bool):
+    """获取（缓存）按文档开关构建的 LangGraph agent。"""
     from agent.graph import build_agent
 
-    key = _memo_key(rag_enabled, visual_enabled, kg_enabled)
+    key = _memo_key(rag_enabled)
     if key not in _AGENT_CACHE:
-        _AGENT_CACHE[key] = build_agent(
-            include_rag=rag_enabled,
-            include_kg=kg_enabled,
-            include_visual=visual_enabled,
-        )
+        _AGENT_CACHE[key] = build_agent(include_rag=rag_enabled)
     return _AGENT_CACHE[key]
 
 
-async def _build_deep_agent(rag_enabled: bool, visual_enabled: bool, kg_enabled: bool):
-    """构建 Deep Agents harness（AGENT_MODE=deep 时使用）。"""
+async def _build_deep_agent(rag_enabled: bool):
+    """构建 Deep Agents harness（AGENT_MODE=deep 时使用，含跨会话记忆 store）。"""
+    from langgraph.store.memory import InMemoryStore
+
     from agent.deep import build_deep_agent
 
     return build_deep_agent(
         include_rag=rag_enabled,
-        include_kg=kg_enabled,
-        include_visual=visual_enabled,
+        store=InMemoryStore(),
     )
 
 
@@ -284,19 +312,18 @@ async def stream_events(
     message: str,
     history: list,
     rag_enabled: bool,
-    visual_enabled: bool = False,
-    kg_enabled: bool = False,
     session_id: Optional[str] = None,
 ) -> AsyncGenerator[Dict, None]:
     """对外结构化事件流：source 卡片先到，随后 status/token/error。
 
+    检索策略由 router.py 自动路由（无需用户选择模式）。
     供 FastAPI `POST /api/chat` 的 SSE 生成器直接转发。
     """
     if not message:
         return
 
     user_row = {"role": "user", "content": message}
-    seed, sources = _seed_retrieve(message, rag_enabled, visual_enabled, kg_enabled)
+    seed, sources = _seed_retrieve(message, rag_enabled)
 
     # 来源卡片先于答案到达
     for s in sources:
@@ -314,17 +341,11 @@ async def stream_events(
             if is_deep:
                 from agent.deep import build_deep_agent
 
-                agent = build_deep_agent(
-                    include_rag=rag_enabled, include_kg=kg_enabled,
-                    include_visual=visual_enabled, checkpointer=saver,
-                )
+                agent = build_deep_agent(include_rag=rag_enabled, checkpointer=saver)
             else:
                 from agent.graph import build_agent
 
-                agent = build_agent(
-                    include_rag=rag_enabled, include_kg=kg_enabled,
-                    include_visual=visual_enabled, checkpointer=saver,
-                )
+                agent = build_agent(include_rag=rag_enabled, checkpointer=saver)
             agent_input = {"messages": seed + [user_row]}
             async for ev in _stream_agent_events(agent, agent_input, config, is_deep, fallback_messages=seed):
                 yield ev
@@ -334,9 +355,9 @@ async def stream_events(
         agent_input = {"messages": seed + history_msgs + [user_row]}
         config = {"recursion_limit": 25}
         if is_deep:
-            agent = await _build_deep_agent(rag_enabled, visual_enabled, kg_enabled)
+            agent = await _build_deep_agent(rag_enabled)
         else:
-            agent = _get_agent(rag_enabled, visual_enabled, kg_enabled)
+            agent = _get_agent(rag_enabled)
         async for ev in _stream_agent_events(agent, agent_input, config, is_deep, fallback_messages=seed):
             yield ev
 
@@ -352,13 +373,16 @@ async def stream_chat(
     visual_enabled: bool = False,
     kg_enabled: bool = False,
 ) -> AsyncGenerator:
-    """薄适配器：把结构化事件重渲染回 Gradio 的 (history + 新行) 形状。"""
+    """薄适配器：把结构化事件重渲染回 Gradio 的 (history + 新行) 形状。
+
+    visual/kg 参数保留仅为兼容旧调用（run_golden），实际由路由自动决定。
+    """
     if not message:
         yield history
         return
 
     user_row = {"role": "user", "content": message}
-    async for ev in stream_events(message, history, rag_enabled, visual_enabled, kg_enabled):
+    async for ev in stream_events(message, history, rag_enabled):
         if ev["type"] in ("status", "token"):
             yield history + [user_row, {"role": "assistant", "content": ev["text"]}]
 

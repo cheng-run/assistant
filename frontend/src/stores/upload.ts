@@ -12,7 +12,7 @@ export const useUploadStore = defineStore("upload", () => {
   const lastResult = ref<UploadResult | null>(null)
   const error = ref("")
 
-  async function upload(file: File, visual: boolean, kg: boolean) {
+  async function upload(file: File) {
     isUploading.value = true
     progress.value = 0
     label.value = "准备上传..."
@@ -22,8 +22,7 @@ export const useUploadStore = defineStore("upload", () => {
 
     const form = new FormData()
     form.append("file", file)
-    form.append("visual", String(visual))
-    form.append("kg", String(kg))
+    // 视觉/KG 索引由后端自动处理（无需前端传参）
 
     const res = await fetch(api.uploadUrl(), { method: "POST", body: form })
     try {

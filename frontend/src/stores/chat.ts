@@ -75,8 +75,6 @@ export const useChatStore = defineStore("chat", () => {
         session_id: sid,
         message: trimmed,
         rag_enabled: settingsStore.ragEnabled,
-        visual_enabled: settingsStore.visualEnabled,
-        kg_enabled: settingsStore.kgEnabled,
       }),
       signal: controller.signal,
     })

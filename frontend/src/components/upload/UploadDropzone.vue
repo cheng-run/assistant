@@ -1,11 +1,9 @@
 <script setup lang="ts">
 import { ref } from "vue"
 import { useUploadStore } from "../../stores/upload"
-import { useSettingsStore } from "../../stores/settings"
 
 const emit = defineEmits<{ done: [] }>()
 const upload = useUploadStore()
-const settings = useSettingsStore()
 const drag = ref(false)
 const fileInput = ref<HTMLInputElement>()
 
@@ -22,7 +20,7 @@ function onFile(f?: File | null) {
     window.alert("仅支持 PDF / DOCX / MD / TXT")
     return
   }
-  void upload.upload(f, settings.visualEnabled, settings.kgEnabled).then(() => {
+  void upload.upload(f).then(() => {
     if (upload.lastResult && !upload.error) emit("done")
   })
 }

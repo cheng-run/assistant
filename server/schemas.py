@@ -9,8 +9,6 @@ class ChatRequest(BaseModel):
     session_id: str
     message: str
     rag_enabled: bool = True
-    visual_enabled: bool = False
-    kg_enabled: bool = False
 
 
 class SessionCreate(BaseModel):

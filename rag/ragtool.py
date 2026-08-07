@@ -1426,7 +1426,38 @@ class RAGTool:
             vector_results, kg_results, top_k_vector=top_k
         )
 
+        # ── 图谱证据跳转：命中实体 → 关联 chunk 原文（kg_chunk_entity_refs 接线） ──
+        try:
+            evidence = self._kg_evidence(query, limit=3)
+            if evidence:
+                kg_context = (kg_context + "\n\n" + evidence) if kg_context else evidence
+        except Exception:
+            pass
+
         return kg_context, chunks
+
+    def _kg_evidence(self, query: str, limit: int = 3) -> str:
+        """图谱 → 证据 chunk 跳转：返回命中实体关联的原文片段。
+
+        复用 kg_chunk_entity_refs（build_knowledge_graph 已写入）与
+        VectorStore.get_by_ids 取原文，让图谱回答有据可依。
+        """
+        try:
+            _, chunk_ids, _ = self.kg_retriever.retrieve_entities_and_chunks(
+                query, top_k_entities=5
+            )
+        except Exception:
+            return ""
+        if not chunk_ids:
+            return ""
+        chunks = self.vector_store.get_by_ids(chunk_ids[:limit])
+        if not chunks:
+            return ""
+        parts = ["## 相关原文证据（来自知识图谱关联）"]
+        for c in chunks:
+            heading = " > ".join(c.get("heading_path", [])) or c.get("source_file", "文档")
+            parts.append(f"[{heading}]\n{c['content'][:200]}")
+        return "\n\n".join(parts)
 
     # ═══════════════════════════════════════════════════════════════
     #  文档大纲提取与缓存

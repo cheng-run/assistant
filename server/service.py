@@ -5,13 +5,19 @@
 """
 
 import asyncio
+import os
 
 from agent.tools import rag
 from server.sse import sse
 
 
-async def run_upload(path: str, fname: str, visual: bool, kg: bool):
-    """按阶段产出 SSE 帧：stage / progress / result / error。"""
+async def run_upload(path: str, fname: str):
+    """按阶段产出 SSE 帧：stage / progress / result / error。
+
+    视觉索引与知识图谱构建均为**自动**（无需用户开关）：
+      - 视觉：仅 PDF 自动索引（_index_visual_pages 内部只对检测到的图表页调 VLM）
+      - KG：默认自动构建，可用环境变量 AUTO_KG=0 关闭（成本控制）
+    """
     try:
         yield sse("stage", {
             "stage": "extract", "pct": 0.05,
@@ -50,8 +56,8 @@ async def run_upload(path: str, fname: str, visual: bool, kg: bool):
 
         kg_note, visual_flag = "", False
 
-        # 视觉索引（可选，仅 PDF）
-        if visual and fname.lower().endswith(".pdf"):
+        # 视觉索引（自动，仅 PDF —— 内部只对检测到的图表页调 VLM）
+        if fname.lower().endswith(".pdf"):
             yield sse("stage", {"stage": "visual", "pct": 0.70, "label": "🎨 [视觉] 生成页面图片并索引..."})
             try:
                 count += await asyncio.to_thread(rag._index_visual_pages, fname, path)
@@ -59,8 +65,8 @@ async def run_upload(path: str, fname: str, visual: bool, kg: bool):
             except Exception:
                 pass  # 视觉索引失败不影响文本路径
 
-        # 知识图谱构建（可选）
-        if kg:
+        # 知识图谱构建（自动，AUTO_KG=0 可关）
+        if os.getenv("AUTO_KG", "1") == "1":
             yield sse("stage", {"stage": "kg", "pct": 0.75, "label": "🧠 [5/5] 构建知识图谱..."})
             try:
                 stats = await asyncio.to_thread(

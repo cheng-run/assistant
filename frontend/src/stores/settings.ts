@@ -3,9 +3,8 @@ import { ref } from "vue"
 import { api } from "../api/endpoints"
 
 export const useSettingsStore = defineStore("settings", () => {
+  // 只保留"文档问答"总开关；视觉/图谱由后端路由引擎自动决策
   const ragEnabled = ref(localStorage.getItem("qa-rag") !== "0")
-  const visualEnabled = ref(localStorage.getItem("qa-visual") === "1")
-  const kgEnabled = ref(localStorage.getItem("qa-kg") === "1")
   const agentMode = ref("reactive")
   const model = ref("")
   const checkpointEnabled = ref(false)
@@ -13,14 +12,6 @@ export const useSettingsStore = defineStore("settings", () => {
   function setRag(v: boolean) {
     ragEnabled.value = v
     localStorage.setItem("qa-rag", v ? "1" : "0")
-  }
-  function setVisual(v: boolean) {
-    visualEnabled.value = v
-    localStorage.setItem("qa-visual", v ? "1" : "0")
-  }
-  function setKg(v: boolean) {
-    kgEnabled.value = v
-    localStorage.setItem("qa-kg", v ? "1" : "0")
   }
 
   async function loadConfig() {
@@ -36,14 +27,10 @@ export const useSettingsStore = defineStore("settings", () => {
 
   return {
     ragEnabled,
-    visualEnabled,
-    kgEnabled,
     agentMode,
     model,
     checkpointEnabled,
     setRag,
-    setVisual,
-    setKg,
     loadConfig,
   }
 })
